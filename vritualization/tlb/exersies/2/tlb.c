@@ -47,7 +47,7 @@ int main(int argc, char *argv[]) {
     free(array);
 
     uint64_t total_ns = end - start;
-    double avg_per_access = (double)total_ns / (num_pages * num_trials);
+    double avg_per_access = (double)total_ns / ((double)num_pages * num_trials);
 
     printf("Total time: %lu ns\n", total_ns);
     printf("Average time per access: %.2f ns\n", avg_per_access);
