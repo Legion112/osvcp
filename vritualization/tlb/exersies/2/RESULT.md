@@ -20,6 +20,16 @@ Average time per access: 14.87 ns
 Total time: 40519140750 ns
 Average time per access: 12.37 ns
 
+```bash
+/home/legion/github/osvcp/tlb 65536 100000
+```
+Total time: 78590548314 ns
+Average time per access: 11.99 ns
+```bash
+/home/legion/github/osvcp/tlb 131072 100000
+```
+Total time: 159022650581 ns
+Average time per access: 12.13 ns
 
 ```bash
 /home/legion/github/osvcp/tlb 100000 100000
