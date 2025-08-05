@@ -3,4 +3,5 @@ project(osvcp C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(osvcp main.c)
+add_executable(osvcp main.c
+        concurrency/locked-data-structures/2/cloppy_counter_only_global_lock.c)
