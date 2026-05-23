@@ -1,3 +1,6 @@
 [submodule "ostep-code"]
 	path = ostep-code
 	url = https://github.com/remzi-arpacidusseau/ostep-code.git
+[submodule "ostep-hw"]
+	path = ostep-hw
+	url = https://gitlab.cs.washington.edu/vishalc/ostep-hw.git
