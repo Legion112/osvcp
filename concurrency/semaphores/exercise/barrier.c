@@ -13,7 +13,10 @@
 // other integers to track things.
 
 typedef struct __barrier_t {
-    // add semaphores and other information here
+    int total;       // total number of threads expected
+    int arrived;     // how many have arrived so far
+    sem_t mutex;     // protects `arrived` counter
+    sem_t barrier;   // blocks threads until all have arrived
 } barrier_t;
 
 
@@ -21,11 +24,24 @@ typedef struct __barrier_t {
 barrier_t b;
 
 void barrier_init(barrier_t *b, int num_threads) {
-    // initialization code goes here
+    b->total = num_threads;
+    b->arrived = 0;
+    Sem_init(&b->mutex, 1);    // mutex starts unlocked
+    Sem_init(&b->barrier, 0);  // barrier starts closed
 }
 
 void barrier(barrier_t *b) {
-    // barrier code goes here
+    Sem_wait(&b->mutex);
+    b->arrived++;
+    int last = (b->arrived == b->total);
+    Sem_post(&b->mutex);
+    if (last) {
+        // wake up all waiting threads (including yourself)
+        for (int i = 0; i < b->total; i++)
+            Sem_post(&b->barrier);
+    }
+    usleep(100);
+    Sem_wait(&b->barrier);  // wait until everyone has arrived
 }
 
 //
