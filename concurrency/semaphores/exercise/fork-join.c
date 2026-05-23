@@ -7,6 +7,7 @@ sem_t s;
 
 void *child(void *arg) {
     printf("child\n");
+    sleep(1);
     // use semaphore here
     return NULL;
 }
