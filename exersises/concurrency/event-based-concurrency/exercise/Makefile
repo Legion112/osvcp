@@ -1,13 +1,16 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -g
 
-TARGETS = tcp-time-server
+TARGETS = tcp-time-server select-server
 
 .PHONY: all clean
 
 all: $(TARGETS)
 
 tcp-time-server: tcp-time-server.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+select-server: select-server.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
