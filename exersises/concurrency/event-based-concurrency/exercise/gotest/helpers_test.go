@@ -82,8 +82,14 @@ func startServer(t *testing.T, binary string, port int, extraArgs ...string) *ex
 	t.Helper()
 	args := append([]string{fmt.Sprintf("%d", port)}, extraArgs...)
 	cmd := exec.Command(binary, args...)
-	cmd.Stdout = os.NewFile(0, os.DevNull)
-	cmd.Stderr = os.NewFile(0, os.DevNull)
+	// os.Stderr is a plain *os.File — Go's exec package passes its fd directly
+	// to the child process (no pipe, no draining goroutine, no buffering).
+	// This is safe: the child inherits the fd and writes go straight to the
+	// terminal, interleaved with normal test output on stderr.
+	// Avoid io.Discard (creates a goroutine+pipe that can block the server on
+	// heavy printf) and os.NewFile(0,...) (GC finalizer closes the test's stdin).
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", binary, err)
 	}
