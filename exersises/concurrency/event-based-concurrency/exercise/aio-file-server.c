@@ -50,6 +50,8 @@
 #include <signal.h>
 #include <aio.h>
 #include <sys/select.h>
+#include <sys/sendfile.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -62,9 +64,11 @@
 #define BACKLOG             128
 #define MAX_CLIENTS         64
 #define REQ_BUF_SIZE        512
-#define WRITE_CHUNK         4096   /* bytes per non-blocking write attempt */
 #define MAX_CACHE_ENTRIES   16
 #define MAX_CACHE_FILE_SIZE (64 * 1024)
+
+/* AIO completion signal: SIGRTMIN+1, blocked and delivered via signalfd. */
+#define AIO_DONE_SIG (SIGRTMIN + 1)
 
 /* ── globals ────────────────────────────────────────────────────────────────── */
 
@@ -133,8 +137,9 @@ static void cache_clear(void) {
 
 typedef enum {
     STATE_READING,   /* accumulating the request line                     */
-    STATE_AIO,       /* aio_read() is in-flight for the file content      */
+    STATE_AIO,       /* aio_read() is in-flight for a small file          */
     STATE_WRITING,   /* sending the response buffer to the client socket  */
+    STATE_SENDFILE,  /* sendfile() in progress for a large (>64 KB) file  */
 } ClientState;
 
 typedef struct {
@@ -153,6 +158,11 @@ typedef struct {
     size_t           resp_size;  /* total bytes to send                         */
     size_t           resp_sent;  /* bytes already written                       */
     struct aiocb     aio;        /* POSIX AIO control block                     */
+
+    /* sendfile path (large files > MAX_CACHE_FILE_SIZE) ------------------- */
+    int              sf_fd;         /* source file fd (open during STATE_SENDFILE)  */
+    off_t            sf_offset;     /* current sendfile file offset                 */
+    size_t           sf_remaining;  /* bytes left to transfer                       */
 
     /* cache --------------------------------------------------------------- */
     char             cache_key[PATH_MAX]; /* resolved path, set in begin_file_serve */
@@ -200,6 +210,9 @@ static void remove_client(int i) {
         aio_return(&c->aio);
         close(c->file_fd);
     }
+    /* Close the sendfile source fd. */
+    if (c->state == STATE_SENDFILE && c->sf_fd >= 0)
+        close(c->sf_fd);
     free(c->resp);
     close(c->sock);
     printf("[%s:%d] disconnected\n", c->ip, c->port);
@@ -222,9 +235,9 @@ static void add_client(int fd, struct sockaddr_in *addr) {
     printf("[%s:%d] connected (%d clients)\n", c->ip, c->port, num_clients);
 }
 
-/* Write len bytes to fd, returning immediately on EAGAIN (partial is OK). */
+/* Write up to len bytes to fd, returning immediately on EAGAIN (partial is OK). */
 static ssize_t nb_write(int fd, const char *buf, size_t len) {
-    ssize_t n = write(fd, buf, len > WRITE_CHUNK ? WRITE_CHUNK : len);
+    ssize_t n = write(fd, buf, len);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         return 0;
     return n;
@@ -244,10 +257,17 @@ static void sock_send(int fd, const char *msg) {
 /*
  * Called when a complete request line has been received.
  *
- * Cache hit:  copies the cached response into a new buffer and transitions
- *             the client directly to STATE_WRITING — no file open, no AIO.
- * Cache miss: validates the path, opens the file, builds the response
- *             buffer header, and issues aio_read() to fill the file portion.
+ * Cache hit:        copies the cached response into a new buffer and transitions
+ *                   the client directly to STATE_WRITING — no file open, no AIO.
+ * Cache miss, small (≤ MAX_CACHE_FILE_SIZE):
+ *                   validates the path, opens the file, builds the response
+ *                   buffer header, and issues aio_read() to fill the file portion.
+ *                   AIO completion is reported via AIO_DONE_SIG → signalfd.
+ * Cache miss, large (> MAX_CACHE_FILE_SIZE):
+ *                   sends the "+OK N\n" header synchronously (small, fits in the
+ *                   socket buffer), then transfers the file body with sendfile(2)
+ *                   via non-blocking STATE_SENDFILE iterations.  No user-space
+ *                   copy, no malloc for the body.
  */
 static void begin_file_serve(Client *c, const char *filename) {
     /* Security check 1 */
@@ -287,10 +307,10 @@ static void begin_file_serve(Client *c, const char *filename) {
             printf("[%s:%d] serving '%s' [cache]\n", c->ip, c->port, filename);
             return;
         }
-        /* malloc failed; fall through to the AIO path */
+        /* malloc failed; fall through to the disk path */
     }
 
-    /* ── Cache miss: security check 3 + AIO ── */
+    /* ── Stat the file (needed for both paths) ── */
     struct stat st;
     if (stat(resolved, &st) < 0 || !S_ISREG(st.st_mode)) {
         sock_send(c->sock, !S_ISREG(st.st_mode)
@@ -304,6 +324,25 @@ static void begin_file_serve(Client *c, const char *filename) {
     char header[64];
     int hlen = snprintf(header, sizeof(header), "+OK %lld\n", (long long)st.st_size);
 
+    /* ── Large file: sendfile path (no user-space copy, no cache) ── */
+    if ((size_t)st.st_size > MAX_CACHE_FILE_SIZE) {
+        /*
+         * Write the small header synchronously.  It fits in a single TCP
+         * segment and the socket buffer is always large enough; sock_send()
+         * loops until every byte is sent.
+         */
+        sock_send(c->sock, header);
+
+        c->sf_fd        = file_fd;
+        c->sf_offset    = 0;
+        c->sf_remaining = (size_t)st.st_size;
+        c->state        = STATE_SENDFILE;
+        printf("[%s:%d] sendfile started for '%s' (%lld bytes)\n",
+               c->ip, c->port, filename, (long long)st.st_size);
+        return;
+    }
+
+    /* ── Small file: AIO path (reads into buffer, populates cache) ── */
     char *resp = malloc((size_t)hlen + (size_t)st.st_size);
     if (!resp) {
         sock_send(c->sock, "-ERR out of memory\n");
@@ -321,7 +360,9 @@ static void begin_file_serve(Client *c, const char *filename) {
     c->aio.aio_buf     = resp + hlen;
     c->aio.aio_nbytes  = (size_t)st.st_size;
     c->aio.aio_offset  = 0;
-    c->aio.aio_sigevent.sigev_notify = SIGEV_NONE;
+    /* Deliver AIO_DONE_SIG when the read completes; signalfd wakes select(). */
+    c->aio.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+    c->aio.aio_sigevent.sigev_signo  = AIO_DONE_SIG;
 
     if (aio_read(&c->aio) < 0) {
         perror("aio_read");
@@ -378,7 +419,7 @@ static int check_aio(Client *c) {
 
 /* ── event loop ──────────────────────────────────────────────────────────────── */
 
-static void event_loop(int listen_fd) {
+static void event_loop(int listen_fd, int aio_sfd) {
     while (running) {
         /* Process any pending cache-clear signal before blocking. */
         if (cache_clear_requested) {
@@ -386,37 +427,47 @@ static void event_loop(int listen_fd) {
             cache_clear();
         }
 
-        /* Build read_fds (listen + all clients) and write_fds (WRITING clients). */
+        /*
+         * Build read_fds (listen + aio_sfd + all clients) and
+         * write_fds (STATE_WRITING and STATE_SENDFILE clients).
+         */
         fd_set read_fds, write_fds;
         FD_ZERO(&read_fds);
         FD_ZERO(&write_fds);
         FD_SET(listen_fd, &read_fds);
-        int max_fd = listen_fd;
-        int aio_pending = 0;
+        FD_SET(aio_sfd,   &read_fds);
+        int max_fd = aio_sfd > listen_fd ? aio_sfd : listen_fd;
 
         for (int i = 0; i < num_clients; i++) {
             int fd = clients[i].sock;
             FD_SET(fd, &read_fds);
-            if (clients[i].state == STATE_WRITING)
+            if (clients[i].state == STATE_WRITING ||
+                clients[i].state == STATE_SENDFILE)
                 FD_SET(fd, &write_fds);
-            if (clients[i].state == STATE_AIO)
-                aio_pending = 1;
             if (fd > max_fd) max_fd = fd;
         }
 
-        struct timeval  tv  = {0, 1000};
-        struct timeval *tvp = aio_pending ? &tv : NULL;
-
-        int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, tvp);
+        /*
+         * No AIO polling timeout: AIO_DONE_SIG is delivered via aio_sfd so
+         * select() wakes up exactly when a read completes.  Pass tvp=NULL to
+         * block until a real event (socket I/O, AIO completion, or signal).
+         */
+        int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, NULL);
         if (ready < 0) {
             /*
-             * SIGINT  → running=0,                 loop exits via while condition.
-             * SIGUSR1 → cache_clear_requested=1,   handled at top of next iteration.
-             * Either way, continue re-evaluates both.
+             * SIGINT  → running=0,               loop exits via while condition.
+             * SIGUSR1 → cache_clear_requested=1, handled at top of next iter.
              */
             if (errno == EINTR) continue;
             perror("select");
             break;
+        }
+
+        /* Drain AIO completion signals so aio_sfd does not fill up. */
+        if (FD_ISSET(aio_sfd, &read_fds)) {
+            struct signalfd_siginfo ssi;
+            while (read(aio_sfd, &ssi, sizeof(ssi)) == (ssize_t)sizeof(ssi))
+                ;   /* drain all queued signals */
         }
 
         /* Accept new connections (drain the queue). */
@@ -447,7 +498,7 @@ static void event_loop(int listen_fd) {
                 }
             }
 
-            /* STATE_AIO: poll for completion. */
+            /* STATE_AIO: check for completion (signalfd woke us up). */
             if (c->state == STATE_AIO) {
                 check_aio(c);
             }
@@ -476,7 +527,7 @@ static void event_loop(int listen_fd) {
                 if (c->req_len >= REQ_BUF_SIZE - 1) { remove_client(i); continue; }
             }
 
-            /* STATE_WRITING: send response chunk. */
+            /* STATE_WRITING: send response chunk (from in-memory buffer). */
             if (c->state == STATE_WRITING && FD_ISSET(c->sock, &write_fds)) {
                 ssize_t n = nb_write(c->sock,
                                      c->resp + c->resp_sent,
@@ -488,6 +539,28 @@ static void event_loop(int listen_fd) {
                     printf("[%s:%d] response sent (%zu bytes)\n",
                            c->ip, c->port, c->resp_size);
                     free(c->resp); c->resp = NULL;
+                    c->state = STATE_READING;
+                }
+            }
+
+            /* STATE_SENDFILE: zero-copy transfer of a large file body. */
+            if (c->state == STATE_SENDFILE && FD_ISSET(c->sock, &write_fds)) {
+                ssize_t sent = sendfile(c->sock, c->sf_fd,
+                                        &c->sf_offset, c->sf_remaining);
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        ; /* socket buffer full — retry on next writable event */
+                    else {
+                        remove_client(i);
+                        continue;
+                    }
+                } else {
+                    c->sf_remaining -= (size_t)sent;
+                }
+                if (c->sf_remaining == 0) {
+                    printf("[%s:%d] sendfile complete (%lld bytes)\n",
+                           c->ip, c->port, (long long)c->sf_offset);
+                    close(c->sf_fd); c->sf_fd = -1;
                     c->state = STATE_READING;
                 }
             }
@@ -513,14 +586,30 @@ int main(int argc, char *argv[]) {
     signal(SIGUSR1, handle_sigusr1);
     signal(SIGPIPE, SIG_IGN);
 
+    /*
+     * Block AIO_DONE_SIG so it is not delivered as a signal but instead
+     * accumulates in the signalfd queue.  select() will wake up when
+     * aio_sfd becomes readable, which happens the moment aio_read()
+     * completes — no 1 ms polling timeout needed.
+     */
+    sigset_t aio_mask;
+    sigemptyset(&aio_mask);
+    sigaddset(&aio_mask, AIO_DONE_SIG);
+    if (sigprocmask(SIG_BLOCK, &aio_mask, NULL) < 0) {
+        perror("sigprocmask"); return EXIT_FAILURE;
+    }
+    int aio_sfd = signalfd(-1, &aio_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (aio_sfd < 0) { perror("signalfd"); return EXIT_FAILURE; }
+
     int listen_fd = create_listen_socket(port);
     printf("AIO file server listening on port %d, docroot=%s\n"
            "(send SIGUSR1 to flush the file cache)\n", port, docroot);
 
-    event_loop(listen_fd);
+    event_loop(listen_fd, aio_sfd);
 
     for (int i = 0; i < num_clients; i++) close(clients[i].sock);
     close(listen_fd);
+    close(aio_sfd);
     cache_clear();
     printf("\nServer shut down.\n");
     return 0;
