@@ -73,6 +73,7 @@ func (fc *fileConn) Do(t *testing.T, filename string) (status string, body []byt
 	if _, err := io.ReadFull(fc.r, body); err != nil {
 		t.Fatalf("read body: %v", err)
 	}
+	fmt.Fprint(os.Stderr, string(body))
 	return status, body
 }
 
@@ -109,7 +110,9 @@ func eachFileServer(t *testing.T, f func(t *testing.T, port int)) {
 			t.Parallel()
 			port := nextPort()
 			cmd := startFileServer(t, bin, port)
-			defer stopServer(t, cmd)
+			t.Cleanup(func() {
+				stopServer(t, cmd)
+			})
 			f(t, port)
 		})
 	}

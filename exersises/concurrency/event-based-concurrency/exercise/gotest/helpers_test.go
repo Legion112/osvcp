@@ -74,6 +74,26 @@ func serverLabel(binary string) string {
 	return filepath.Base(binary)
 }
 
+// serverStderr returns os.Stderr when the caller explicitly opts in by
+// setting TEST_VERBOSE_SERVERS=1, otherwise nil (→ /dev/null).
+//
+// Why not auto-detect a TTY?
+//
+//	GoLand (and many CI systems) connect the process to a pseudo-terminal
+//	(PTY).  A PTY is a character device, so os.ModeCharDevice is set, but
+//	its kernel buffer is tiny (~4 KB).  Four servers logging 20 concurrent
+//	clients fill it instantly, blocking every server on printf → deadlock.
+//
+// Usage:
+//
+//	TEST_VERBOSE_SERVERS=1 go test -v -run TestFile
+func serverStderr() *os.File {
+	if os.Getenv("TEST_VERBOSE_SERVERS") != "" {
+		return os.Stderr
+	}
+	return nil
+}
+
 // ── server lifecycle ──────────────────────────────────────────────────────────
 
 // startServer launches binary on port (with optional extra args), waits up to
@@ -82,14 +102,14 @@ func startServer(t *testing.T, binary string, port int, extraArgs ...string) *ex
 	t.Helper()
 	args := append([]string{fmt.Sprintf("%d", port)}, extraArgs...)
 	cmd := exec.Command(binary, args...)
-	// os.Stderr is a plain *os.File — Go's exec package passes its fd directly
-	// to the child process (no pipe, no draining goroutine, no buffering).
-	// This is safe: the child inherits the fd and writes go straight to the
-	// terminal, interleaved with normal test output on stderr.
-	// Avoid io.Discard (creates a goroutine+pipe that can block the server on
-	// heavy printf) and os.NewFile(0,...) (GC finalizer closes the test's stdin).
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	// Route child stdout/stderr to os.Stderr only when TEST_VERBOSE_SERVERS=1.
+	// Default is nil (→ /dev/null, no pipe, no goroutine).
+	// io.Discard creates a goroutine+pipe that fills under heavy server logging.
+	// os.Stderr goes to GoLand's PTY whose tiny kernel buffer (~4 KB) fills
+	// just as fast, blocking every server on printf and deadlocking the test.
+	out := os.Stderr
+	cmd.Stdout = out
+	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", binary, err)
 	}
@@ -115,7 +135,19 @@ func stopServer(t *testing.T, cmd *exec.Cmd) {
 		return
 	}
 	cmd.Process.Signal(os.Interrupt) //nolint:errcheck
-	cmd.Wait()                       //nolint:errcheck
+
+	// Give the server up to 2 s to exit gracefully after SIGINT, then SIGKILL.
+	// Without a timeout, a server that ignores SIGINT (e.g. a Tokio process
+	// that absorbs the signal internally without a ctrl_c() consumer) would
+	// leave cmd.Wait() blocked forever, hanging the test goroutine.
+	done := make(chan struct{})
+	go func() { cmd.Wait(); close(done) }() //nolint:errcheck
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		cmd.Process.Kill() //nolint:errcheck
+		<-done
+	}
 }
 
 // ── raw TCP helpers ───────────────────────────────────────────────────────────
