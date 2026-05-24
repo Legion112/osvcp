@@ -6,7 +6,7 @@
 #include "mythreads.h"
 
 #include "main-header.h"
-#include "educative-code-widget/educative-code-widget-files/vector-header.h"
+#include "vector-header.h"
 
 void vector_add(vector_t *v_dst, vector_t *v_src) {
     Pthread_mutex_lock(&v_dst->lock);

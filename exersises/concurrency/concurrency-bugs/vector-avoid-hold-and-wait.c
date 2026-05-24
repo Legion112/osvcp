@@ -7,7 +7,7 @@
 #include "mythreads.h"
 
 #include "main-header.h"
-#include "educative-code-widget/educative-code-widget-files/vector-header.h"
+#include "vector-header.h"
 
 // use this to make lock acquisition ATOMIC
 pthread_mutex_t global = PTHREAD_MUTEX_INITIALIZER; 
