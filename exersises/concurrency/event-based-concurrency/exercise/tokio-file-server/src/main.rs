@@ -31,6 +31,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, tcp::OwnedWriteHalf};
+use tokio::signal;
 
 const DEFAULT_PORT: u16 = 8085;
 const FILE_CHUNK:   usize = 4096;
@@ -164,13 +165,23 @@ async fn main() {
     // Accept loop: spawn a task per connection.
     // Each task is lightweight (~few KB stack) and independently scheduled by
     // Tokio — no select() loop, no fd_set, no O_NONBLOCK juggling.
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let docroot = Arc::clone(&docroot);
-                tokio::spawn(handle_connection(stream, docroot));
+    //
+    // tokio::select! races the accept loop against ctrl_c() (SIGINT).
+    // Without an explicit ctrl_c() consumer Tokio intercepts SIGINT via its
+    // internal signal machinery but never acts on it, so the process would
+    // ignore the signal and cmd.Wait() in the test harness would block forever.
+    tokio::select! {
+        _ = signal::ctrl_c() => {},
+        _ = async {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let docroot = Arc::clone(&docroot);
+                        tokio::spawn(handle_connection(stream, docroot));
+                    }
+                    Err(e) => eprintln!("accept: {e}"),
+                }
             }
-            Err(e) => eprintln!("accept: {e}"),
-        }
+        } => {},
     }
 }
