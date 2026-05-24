@@ -122,12 +122,13 @@ static void cache_insert(const char *key, char *resp, size_t resp_size) {
 }
 
 static void cache_clear(void) {
+    int n = cache_size;
     for (int i = 0; i < cache_size; i++) {
         free(cache[i].resp);
         cache[i].resp = NULL;
     }
     cache_size = 0;
-    fprintf(stderr, "[cache] cleared (%d entries flushed)\n", cache_size);
+    fprintf(stderr, "[cache] cleared (%d entries flushed)\n", n);
 }
 
 /* ── per-connection state ──────────────────────────────────────────────────── */
