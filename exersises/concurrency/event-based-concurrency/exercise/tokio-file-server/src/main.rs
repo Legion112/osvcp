@@ -1,55 +1,92 @@
 // Exercise 4 (Rust): async file-serving TCP server using Tokio
 //
+// File cache (exercise 5):
+//   • An Arc<Mutex<FileCache>> is shared between the accept loop and every
+//     connection task.  On a cache hit the file is served from memory with no
+//     tokio::fs I/O at all.
+//   • A dedicated Tokio task listens for SIGUSR1 and flushes the cache.
+//   • Signal safety: tokio::signal::unix converts the OS signal into an async
+//     event, so no raw signal-handler concerns arise.
+//
 // Compare this to aio-file-server.c — both solve the same problem:
 // never block the event loop on file I/O or slow clients.
 //
-// In C (POSIX AIO) we had to:
-//   • Write a 3-state state machine per client (READING / AIO / WRITING)
-//   • Poll aio_error() every loop iteration with a 1 ms timeout
-//   • Manage O_NONBLOCK sockets and partial writes manually
-//   • Handle aio_cancel() on disconnect
-//   • ~400 lines of careful, error-prone C
-//
-// Here, the Tokio runtime handles all of that invisibly:
-//   • tokio::fs::File         async file reads (thread pool or io_uring)
-//   • tokio::net::TcpStream   async socket I/O (epoll/kqueue/IOCP)
-//   • tokio::spawn            one lightweight task per connection
-//   • async/await             the compiler generates the state machine
-//
-// The result is ~130 lines that are structurally identical to the
-// original synchronous file-server.c — no manual state machine required.
-//
 // Usage:
 //   cargo run --bin file-server-tokio -- [port [docroot]]
-//   Default port:    8085
-//   Default docroot: ./docroot
+//   kill -USR1 <pid>    # flush cache
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, tcp::OwnedWriteHalf};
 use tokio::signal;
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
-const DEFAULT_PORT: u16 = 8085;
-const FILE_CHUNK:   usize = 4096;
+const DEFAULT_PORT:         u16   = 8085;
+const FILE_CHUNK:           usize = 4096;
+const MAX_CACHE_ENTRIES:    usize = 16;
+const MAX_CACHE_FILE_BYTES: u64   = 64 * 1024;
+
+// ── file cache ────────────────────────────────────────────────────────────────
+
+/// Thread-safe in-process cache shared across all connection tasks.
+///
+/// Values are pre-built response bytes (`+OK <n>\n` + file content) so a
+/// cache hit requires no disk I/O — just a single `write_all`.
+///
+/// Arc<Mutex<…>> is safe here because the lock is held only briefly (HashMap
+/// lookup / insert), never across an `.await` point.
+type FileCache = Arc<Mutex<FileCacheInner>>;
+
+struct FileCacheInner {
+    entries: HashMap<PathBuf, Vec<u8>>,
+    order:   Vec<PathBuf>,
+}
+
+impl FileCacheInner {
+    fn new() -> Self {
+        FileCacheInner { entries: HashMap::new(), order: Vec::new() }
+    }
+
+    fn get(&self, key: &Path) -> Option<Vec<u8>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: PathBuf, resp: Vec<u8>) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, resp);
+            return;
+        }
+        if self.entries.len() >= MAX_CACHE_ENTRIES {
+            if !self.order.is_empty() {
+                let oldest = self.order.remove(0);
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push(key.clone());
+        self.entries.insert(key, resp);
+    }
+
+    fn clear(&mut self) {
+        let n = self.entries.len();
+        self.entries.clear();
+        self.order.clear();
+        eprintln!("[cache] cleared ({n} entries flushed)");
+    }
+}
 
 // ── security ──────────────────────────────────────────────────────────────────
 
-/// Validate the filename and resolve it to an absolute path inside docroot.
-/// Returns `Ok(resolved)` or an error string to send to the client.
 fn resolve_path(filename: &str, docroot: &Path) -> Result<PathBuf, &'static str> {
-    if filename.is_empty()        { return Err("empty filename"); }
-    if filename.starts_with('/')  { return Err("absolute paths not allowed"); }
+    if filename.is_empty()       { return Err("empty filename"); }
+    if filename.starts_with('/') { return Err("absolute paths not allowed"); }
 
-    // std::fs::canonicalize calls realpath(2) — resolves ".." and symlinks.
-    // Returns Err if the path does not exist, which we treat as "not found".
     let resolved = std::fs::canonicalize(docroot.join(filename))
         .map_err(|_| "not found")?;
-
-    // Component-level prefix check: "/a/b" starts_with "/a" but "/ab" does not.
     if !resolved.starts_with(docroot) {
         return Err("access denied");
     }
@@ -58,16 +95,14 @@ fn resolve_path(filename: &str, docroot: &Path) -> Result<PathBuf, &'static str>
 
 // ── file serving ──────────────────────────────────────────────────────────────
 
-/// Serve one file request: validate path, send +OK header, stream content.
-/// Returns Err only on a broken pipe / network error (caller closes connection).
 async fn serve_file(
-    writer:   &mut OwnedWriteHalf,
-    filename: &str,
-    docroot:  &Path,
-    peer:     &str,
+    writer:  &mut OwnedWriteHalf,
+    name:    &str,
+    docroot: &Path,
+    peer:    &str,
+    cache:   &FileCache,
 ) -> io::Result<()> {
-    // Resolve and validate (sync — path resolution is fast on local disk).
-    let resolved = match resolve_path(filename, docroot) {
+    let resolved = match resolve_path(name, docroot) {
         Ok(p)    => p,
         Err(msg) => {
             writer.write_all(format!("-ERR {msg}\n").as_bytes()).await?;
@@ -75,63 +110,87 @@ async fn serve_file(
         }
     };
 
-    // Check it is a regular file.
+    // ── Cache hit ────────────────────────────────────────────────────────────
+    // Scope the lock so the guard is dropped before any .await point.
+    // (MutexGuard is !Send so tokio::spawn requires it not to be held across
+    // an await.)
+    let cached: Option<Vec<u8>> = cache.lock().unwrap().get(&resolved);
+    if let Some(resp) = cached {
+        writer.write_all(&resp).await?;
+        println!("[{peer}] served '{name}' [cache]");
+        return Ok(());
+    }
+
+    // ── Cache miss: read from disk ────────────────────────────────────────────
     let meta = match fs::metadata(&resolved).await {
         Ok(m) if m.is_file() => m,
         Ok(_)  => { writer.write_all(b"-ERR not a regular file\n").await?; return Ok(()); }
         Err(e) => { writer.write_all(format!("-ERR metadata: {e}\n").as_bytes()).await?; return Ok(()); }
     };
 
-    // Open asynchronously — tokio delegates to a thread pool (or io_uring when
-    // available) so this never blocks the executor.
     let file = match fs::File::open(&resolved).await {
         Ok(f)  => f,
         Err(e) => { writer.write_all(format!("-ERR open: {e}\n").as_bytes()).await?; return Ok(()); }
     };
 
-    let size = meta.len();
-    writer.write_all(format!("+OK {size}\n").as_bytes()).await?;
+    let size   = meta.len();
+    let header = format!("+OK {size}\n");
 
-    // Stream the file in chunks. tokio::fs::File::read() is async; each .await
-    // yields back to the executor if no data is immediately available, allowing
-    // other tasks to run — no manual AIO polling or state machine needed.
-    let mut reader = BufReader::with_capacity(FILE_CHUNK, file);
-    let mut chunk  = vec![0u8; FILE_CHUNK];
-    loop {
-        let n = reader.read(&mut chunk).await?;
-        if n == 0 { break; }
-        writer.write_all(&chunk[..n]).await?;
+    if size <= MAX_CACHE_FILE_BYTES {
+        // Read entire file, build full response, cache, send.
+        let mut body = vec![0u8; size as usize];
+        let mut reader = BufReader::with_capacity(FILE_CHUNK, file);
+        reader.read_exact(&mut body).await?;
+
+        let mut resp = Vec::with_capacity(header.len() + body.len());
+        resp.extend_from_slice(header.as_bytes());
+        resp.extend_from_slice(&body);
+
+        writer.write_all(&resp).await?;
+        cache.lock().unwrap().insert(resolved, resp);
+    } else {
+        // Large file: stream without caching.
+        writer.write_all(header.as_bytes()).await?;
+        let mut reader = BufReader::with_capacity(FILE_CHUNK, file);
+        let mut chunk  = vec![0u8; FILE_CHUNK];
+        loop {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 { break; }
+            writer.write_all(&chunk[..n]).await?;
+        }
     }
 
-    println!("[{peer}] served '{filename}' ({size} bytes)");
+    println!("[{peer}] served '{name}' ({size} bytes)");
     Ok(())
 }
 
 // ── per-connection handler ────────────────────────────────────────────────────
 
-/// Handle all requests on one connection until the client disconnects.
-/// Each connection runs in its own Tokio task — there is no shared mutable
-/// state between tasks, so no locks are needed.
-async fn handle_connection(stream: tokio::net::TcpStream, docroot: Arc<PathBuf>) {
+async fn handle_connection(
+    stream:  tokio::net::TcpStream,
+    docroot: Arc<PathBuf>,
+    cache:   FileCache,
+) {
     let peer = stream.peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     println!("[{peer}] connected");
 
-    // Split: the read half is line-buffered; the write half is used directly.
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    // Read one request line at a time, serve each, repeat until EOF.
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
                 let filename = line.trim_end_matches(['\r', '\n']);
-                if serve_file(&mut write_half, filename, &docroot, &peer).await.is_err() {
-                    break;  // broken pipe — client disconnected
+                if serve_file(&mut write_half, filename, &docroot, &peer, &cache)
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
-            _ => break,  // EOF or error
+            _ => break,
         }
     }
 
@@ -146,11 +205,12 @@ async fn main() {
     let port: u16  = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
     let root: &str = args.get(2).map(String::as_str).unwrap_or("./docroot");
 
-    // Resolve docroot once at startup (sync is fine here).
     let docroot = Arc::new(match std::fs::canonicalize(root) {
         Ok(p)  => p,
         Err(e) => { eprintln!("docroot '{root}': {e}"); std::process::exit(1); }
     });
+
+    let cache: FileCache = Arc::new(Mutex::new(FileCacheInner::new()));
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
         eprintln!("bind: {e}"); std::process::exit(1);
@@ -160,16 +220,22 @@ async fn main() {
         "Tokio async file server listening on port {port}, docroot={}",
         docroot.display()
     );
-    println!("(one task per connection, fully async I/O — no manual state machine)");
+    println!("(send SIGUSR1 to flush the file cache)");
 
-    // Accept loop: spawn a task per connection.
-    // Each task is lightweight (~few KB stack) and independently scheduled by
-    // Tokio — no select() loop, no fd_set, no O_NONBLOCK juggling.
-    //
-    // tokio::select! races the accept loop against ctrl_c() (SIGINT).
-    // Without an explicit ctrl_c() consumer Tokio intercepts SIGINT via its
-    // internal signal machinery but never acts on it, so the process would
-    // ignore the signal and cmd.Wait() in the test harness would block forever.
+    // Spawn a task that listens for SIGUSR1 and clears the cache.
+    // tokio::signal::unix converts the OS signal into an async event stream,
+    // so this task parks itself cheaply between signals.
+    let cache_for_signal = Arc::clone(&cache);
+    tokio::spawn(async move {
+        let mut sigusr1 = unix_signal(SignalKind::user_defined1())
+            .expect("SIGUSR1 handler");
+        loop {
+            sigusr1.recv().await;
+            cache_for_signal.lock().unwrap().clear();
+        }
+    });
+
+    // Accept loop races against SIGINT (ctrl_c).
     tokio::select! {
         _ = signal::ctrl_c() => {},
         _ = async {
@@ -177,7 +243,8 @@ async fn main() {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let docroot = Arc::clone(&docroot);
-                        tokio::spawn(handle_connection(stream, docroot));
+                        let cache   = Arc::clone(&cache);
+                        tokio::spawn(handle_connection(stream, docroot, cache));
                     }
                     Err(e) => eprintln!("accept: {e}"),
                 }
