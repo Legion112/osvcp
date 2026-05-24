@@ -44,6 +44,11 @@ func nextPort() int { return int(portSeed.Add(1)) }
 // ── binary lists ──────────────────────────────────────────────────────────────
 
 // fileServerBinaries returns the list of file-server binaries to test.
+// Includes the original select()-based versions and the new async versions:
+//   - file-server:         C select() + blocking I/O  (exercise 3)
+//   - file-server-rs:      Rust select() + blocking I/O  (exercise 3)
+//   - aio-file-server:     C select() + POSIX aio_read()  (exercise 4)
+//   - file-server-tokio:   Rust tokio async/await  (exercise 4)
 func fileServerBinaries() []string {
 	if v := os.Getenv("TEST_FILE_SERVERS"); v != "" {
 		return strings.Split(v, ",")
@@ -51,6 +56,8 @@ func fileServerBinaries() []string {
 	return []string{
 		"../file-server",
 		"../rust-file-server/target/debug/file-server-rs",
+		"../aio-file-server",
+		"../tokio-file-server/target/debug/file-server-tokio",
 	}
 }
 
