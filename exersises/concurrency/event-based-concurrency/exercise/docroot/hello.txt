@@ -1,0 +1,2 @@
+Hello from the file server!
+This is hello.txt living in the docroot.

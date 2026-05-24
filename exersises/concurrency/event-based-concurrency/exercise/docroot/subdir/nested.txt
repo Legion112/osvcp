@@ -1,0 +1,2 @@
+This file is inside a subdirectory.
+Serving it verifies that subdir/ paths work correctly.
