@@ -1,0 +1,14 @@
+[package]
+name = "rust-file-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "file-server-rs"
+path = "src/main.rs"
+
+[dependencies]
+nix  = { version = "0.31", features = ["net", "fs", "signal", "poll"] }
+libc = "0.2"
+
+[dev-dependencies]
