@@ -1,13 +1,15 @@
-// Integration tests for the Rust file server.
+// Integration tests for the file server (Exercise 3).
 //
-// Each test starts a fresh server process on its own port, exercises it over
-// real TCP connections, then kills the server.  No mocking — every test
-// hits the actual binary.
+// The same test suite runs against every configured implementation.
+// By default both the C and Rust binaries are tested.
+// Override with the TEST_FILE_SERVERS env var (colon-separated paths):
 //
-// Run:
-//   cargo test
-//   cargo test -- --nocapture         (see server stdout)
-//   cargo test test_path_escape       (single test)
+//   TEST_FILE_SERVERS=../file-server                   cargo test   # C only
+//   TEST_FILE_SERVERS=target/debug/file-server-rs      cargo test   # Rust only
+//   TEST_FILE_SERVERS=../file-server:target/debug/...  cargo test   # both
+//
+// Run a single test:
+//   cargo test test_path_escape
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -17,11 +19,31 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 // ── port allocation ───────────────────────────────────────────────────────────
-// Each test gets a unique port, so they can run in parallel safely.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(19200);
+
+static NEXT_PORT: AtomicU16 = AtomicU16::new(19300);
 
 fn next_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+}
+
+// ── binary list ───────────────────────────────────────────────────────────────
+
+/// Returns the list of server binaries to test.
+/// Reads TEST_FILE_SERVERS (colon-separated) or falls back to both C and Rust.
+fn server_binaries() -> Vec<PathBuf> {
+    if let Ok(var) = std::env::var("TEST_FILE_SERVERS") {
+        return var.split(':').map(PathBuf::from).collect();
+    }
+
+    let rust_bin = PathBuf::from(env!("CARGO_BIN_EXE_file-server-rs"));
+
+    // The C binary lives one directory above the Cargo workspace root.
+    let c_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("file-server");
+
+    vec![c_bin, rust_bin]
 }
 
 // ── server lifecycle ──────────────────────────────────────────────────────────
@@ -30,41 +52,43 @@ struct Server {
     child:   Child,
     port:    u16,
     docroot: PathBuf,
+    label:   String,
 }
 
 impl Server {
-    /// Start the server binary and wait until the port is accepting connections.
-    fn start(port: u16) -> Self {
-        // Resolve docroot relative to the workspace root (where `cargo test` runs).
+    fn start(binary: &PathBuf, port: u16) -> Self {
         let docroot = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()           // exercise/rust-file-server → exercise/
+            .parent()
             .unwrap()
             .join("docroot")
             .canonicalize()
             .expect("docroot must exist");
 
-        let bin = PathBuf::from(env!("CARGO_BIN_EXE_file-server-rs"));
+        let label = binary
+            .file_name()
+            .unwrap_or(binary.as_os_str())
+            .to_string_lossy()
+            .into_owned();
 
-        let child = Command::new(&bin)
+        let child = Command::new(binary)
             .arg(port.to_string())
             .arg(&docroot)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to spawn server");
+            .unwrap_or_else(|e| panic!("spawn {label}: {e}"));
 
-        // Poll until the port accepts connections (up to 1 s).
         let addr = format!("127.0.0.1:{port}");
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if TcpStream::connect(&addr).is_ok() { break; }
             if Instant::now() > deadline {
-                panic!("server on port {port} not ready within 1 s");
+                panic!("{label} on port {port} not ready within 2 s");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        Server { child, port, docroot }
+        Server { child, port, docroot, label }
     }
 
     fn connect(&self) -> io::Result<Conn> {
@@ -89,198 +113,168 @@ struct Conn {
 }
 
 impl Conn {
-    /// Send "<filename>\n" to the server.
     fn request(&mut self, filename: &str) -> io::Result<()> {
         write!(self.writer, "{filename}\n")?;
         self.writer.flush()
     }
 
-    /// Read the status line (+OK <size> or -ERR <reason>).
     fn read_status(&mut self) -> io::Result<String> {
         let mut line = String::new();
         self.reader.read_line(&mut line)?;
         Ok(line.trim_end_matches(['\n', '\r']).to_owned())
     }
 
-    /// Read exactly `n` bytes of body content.
     fn read_body(&mut self, n: u64) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; n as usize];
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
     }
 
-    /// High-level: send request, read and parse status, read body if +OK.
-    /// Returns (status_line, Option<body_bytes>).
+    /// Send request, parse status, read body if +OK.
     fn do_request(&mut self, filename: &str) -> io::Result<(String, Option<Vec<u8>>)> {
         self.request(filename)?;
         let status = self.read_status()?;
-
         if let Some(rest) = status.strip_prefix("+OK ") {
             let size: u64 = rest.parse().expect("size must be a number");
-            let body = self.read_body(size)?;
-            Ok((status, Some(body)))
+            Ok((status, Some(self.read_body(size)?)))
         } else {
             Ok((status, None))
         }
     }
 }
 
+// ── test runner ───────────────────────────────────────────────────────────────
+
+/// Run `f` once for every configured server binary.
+/// Panics with a clear label if any invocation fails.
+fn for_each_server(f: impl Fn(&Server)) {
+    for bin in server_binaries() {
+        let srv = Server::start(&bin, next_port());
+        println!("  → testing {}", srv.label);
+        f(&srv);
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-/// Verify content of a served file matches what's on disk.
 #[test]
 fn test_serve_file() {
-    let srv = Server::start(next_port());
-    let mut conn = srv.connect().unwrap();
-
-    let (status, body) = conn.do_request("hello.txt").unwrap();
-    assert!(status.starts_with("+OK"), "expected +OK, got {status:?}");
-
-    let want = std::fs::read(srv.docroot.join("hello.txt")).unwrap();
-    assert_eq!(body.unwrap(), want);
+    for_each_server(|srv| {
+        let want = std::fs::read(srv.docroot.join("hello.txt")).unwrap();
+        let (status, body) = srv.connect().unwrap().do_request("hello.txt").unwrap();
+        assert!(status.starts_with("+OK"), "[{}] expected +OK, got {status:?}", srv.label);
+        assert_eq!(body.unwrap(), want, "[{}] content mismatch", srv.label);
+    });
 }
 
-/// Files inside subdirectories must be reachable.
 #[test]
 fn test_serve_subdir_file() {
-    let srv = Server::start(next_port());
-    let mut conn = srv.connect().unwrap();
-
-    let (status, body) = conn.do_request("subdir/nested.txt").unwrap();
-    assert!(status.starts_with("+OK"), "expected +OK, got {status:?}");
-
-    let want = std::fs::read(srv.docroot.join("subdir/nested.txt")).unwrap();
-    assert_eq!(body.unwrap(), want);
+    for_each_server(|srv| {
+        let want = std::fs::read(srv.docroot.join("subdir/nested.txt")).unwrap();
+        let (status, body) = srv.connect().unwrap().do_request("subdir/nested.txt").unwrap();
+        assert!(status.starts_with("+OK"), "[{}] expected +OK, got {status:?}", srv.label);
+        assert_eq!(body.unwrap(), want, "[{}] content mismatch", srv.label);
+    });
 }
 
-/// Two requests on the same connection — tests that the +OK <size> framing is
-/// correct: the second request's reader starts at the right byte position.
+/// Two requests on one connection — verifies +OK framing across requests.
 #[test]
 fn test_multiple_requests_same_conn() {
-    let srv = Server::start(next_port());
-    let mut conn = srv.connect().unwrap();
-
-    for name in ["hello.txt", "pangrams.txt"] {
-        let (status, body) = conn.do_request(name).unwrap();
-        assert!(status.starts_with("+OK"), "[{name}] expected +OK, got {status:?}");
-
-        let want = std::fs::read(srv.docroot.join(name)).unwrap();
-        assert_eq!(body.unwrap(), want, "[{name}] content mismatch");
-    }
+    for_each_server(|srv| {
+        let mut conn = srv.connect().unwrap();
+        for name in ["hello.txt", "pangrams.txt"] {
+            let want = std::fs::read(srv.docroot.join(name)).unwrap();
+            let (status, body) = conn.do_request(name).unwrap();
+            assert!(status.starts_with("+OK"), "[{}][{name}] expected +OK, got {status:?}", srv.label);
+            assert_eq!(body.unwrap(), want, "[{}][{name}] content mismatch", srv.label);
+        }
+    });
 }
 
-/// Requesting a non-existent file must return -ERR.
 #[test]
 fn test_missing_file() {
-    let srv = Server::start(next_port());
-    let mut conn = srv.connect().unwrap();
-
-    let (status, _) = conn.do_request("does-not-exist.txt").unwrap();
-    assert!(status.starts_with("-ERR"), "expected -ERR, got {status:?}");
+    for_each_server(|srv| {
+        let (status, _) = srv.connect().unwrap().do_request("no-such-file.txt").unwrap();
+        assert!(status.starts_with("-ERR"), "[{}] expected -ERR, got {status:?}", srv.label);
+    });
 }
 
-/// Absolute paths ("/etc/passwd") must be rejected before touching the fs.
 #[test]
 fn test_absolute_path_rejected() {
-    let srv = Server::start(next_port());
-    let mut conn = srv.connect().unwrap();
-
-    let (status, _) = conn.do_request("/etc/passwd").unwrap();
-    assert!(status.starts_with("-ERR"), "expected -ERR, got {status:?}");
+    for_each_server(|srv| {
+        let (status, _) = srv.connect().unwrap().do_request("/etc/passwd").unwrap();
+        assert!(status.starts_with("-ERR"), "[{}] expected -ERR, got {status:?}", srv.label);
+    });
 }
 
-/// "../" traversal attempts must never escape the docroot.
 #[test]
 fn test_path_escape_rejected() {
-    let srv = Server::start(next_port());
-
-    let escape_paths = [
-        "../../etc/passwd",
-        "../file-server.c",
-        "../file-server",
-        "subdir/../../file-server.c",
-    ];
-
-    for path in escape_paths {
-        // Need a fresh connection per request because the server may close on
-        // error (reconnect keeps tests independent even if one fails).
-        let mut c = srv.connect().unwrap();
-        let (status, _) = c.do_request(path).unwrap();
-        assert!(
-            status.starts_with("-ERR"),
-            "escape {path:?} was NOT rejected: got {status:?}"
-        );
-    }
+    for_each_server(|srv| {
+        for path in ["../../etc/passwd", "../file-server.c", "subdir/../../file-server.c"] {
+            let (status, _) = srv.connect().unwrap().do_request(path).unwrap();
+            assert!(
+                status.starts_with("-ERR"),
+                "[{}] escape {path:?} not rejected: got {status:?}", srv.label
+            );
+        }
+    });
 }
 
-/// A client that connects and immediately closes must not crash the server.
 #[test]
 fn test_abrupt_disconnect_survives() {
-    let srv = Server::start(next_port());
-
-    // Rude client: connect and drop immediately.
-    drop(srv.connect().unwrap());
-    std::thread::sleep(Duration::from_millis(50));
-
-    // Server must still be alive.
-    let (status, _) = srv.connect().unwrap().do_request("hello.txt").unwrap();
-    assert!(status.starts_with("+OK"), "server dead after disconnect: {status:?}");
+    for_each_server(|srv| {
+        drop(srv.connect().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        let (status, _) = srv.connect().unwrap().do_request("hello.txt").unwrap();
+        assert!(status.starts_with("+OK"), "[{}] server dead after disconnect: {status:?}", srv.label);
+    });
 }
 
-/// The request is trickled one byte at a time. The server must buffer the
-/// partial data and only reply after the terminating '\n' arrives.
 #[test]
 fn test_partial_line_buffering() {
-    let srv = Server::start(next_port());
+    for_each_server(|srv| {
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", srv.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream.try_clone().unwrap();
 
-    let stream = TcpStream::connect(format!("127.0.0.1:{}", srv.port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut writer = stream.try_clone().unwrap();
+        for b in b"hello.txt" {
+            writer.write_all(&[*b]).unwrap();
+            writer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
-    // Write "hello.txt" one byte at a time, pausing between each byte.
-    for b in b"hello.txt" {
-        writer.write_all(&[*b]).unwrap();
+        // No newline yet — server must NOT reply.
+        let mut early = String::new();
+        let _ = reader.read_line(&mut early);
+        assert!(early.is_empty(), "[{}] replied before newline: {early:?}", srv.label);
+
+        writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-    }
 
-    // No '\n' yet — server must NOT have replied.
-    let mut early = String::new();
-    let _ = reader.read_line(&mut early); // expected to time out
-    assert!(early.is_empty(), "server replied before newline: {early:?}");
-
-    // Send the newline; now a response must arrive.
-    writer.write_all(b"\n").unwrap();
-    writer.flush().unwrap();
-
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    assert!(
-        status.trim_end_matches(['\n', '\r']).starts_with("+OK"),
-        "expected +OK after newline, got {status:?}"
-    );
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        assert!(
+            status.trim_end_matches(['\n', '\r']).starts_with("+OK"),
+            "[{}] expected +OK after newline, got {status:?}", srv.label
+        );
+    });
 }
 
-/// 20 goroutines-worth of threads each request a different file at the same
-/// time. Every one must get the correct bytes back.
 #[test]
 fn test_simultaneous_reads() {
-    let port = next_port();
-    let srv = Server::start(port);
+    for_each_server(|srv| {
+        let port   = srv.port;
+        let files  = ["hello.txt", "pangrams.txt", "subdir/nested.txt"];
+        let wants: Vec<Vec<u8>> = files.iter()
+            .map(|f| std::fs::read(srv.docroot.join(f)).unwrap())
+            .collect();
 
-    let docroot = srv.docroot.clone();
-    let files   = ["hello.txt", "pangrams.txt", "subdir/nested.txt"];
-    let wants: Vec<Vec<u8>> = files
-        .iter()
-        .map(|f| std::fs::read(docroot.join(f)).unwrap())
-        .collect();
-
-    let handles: Vec<_> = (0..20)
-        .map(|i| {
+        let handles: Vec<_> = (0..20).map(|i| {
             let name  = files[i % files.len()].to_owned();
             let want  = wants[i % files.len()].clone();
+            let label = srv.label.clone();
             std::thread::spawn(move || {
                 let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -289,11 +283,11 @@ fn test_simultaneous_reads() {
                     writer: stream,
                 };
                 let (status, body) = conn.do_request(&name).unwrap();
-                assert!(status.starts_with("+OK"), "client {i} [{name}]: {status:?}");
-                assert_eq!(body.unwrap(), want, "client {i} [{name}]: content mismatch");
+                assert!(status.starts_with("+OK"), "[{label}] client {i} [{name}]: {status:?}");
+                assert_eq!(body.unwrap(), want, "[{label}] client {i} [{name}]: mismatch");
             })
-        })
-        .collect();
+        }).collect();
 
-    for h in handles { h.join().expect("thread panicked"); }
+        for h in handles { h.join().expect("thread panicked"); }
+    });
 }

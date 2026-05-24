@@ -1,14 +1,14 @@
-// Tests for file-server (Exercise 3).
+// Tests for the file-server (Exercise 3).
 //
-// Protocol under test:
+// Protocol:
+//   Client → Server:  <relative-filename>\n
+//   Server → Client:  +OK <size>\n<content>   on success
+//                     -ERR <reason>\n          on failure
 //
-//	Client → Server:  <relative-filename>\n
-//	Server → Client:  +OK <size>\n<content>   on success
-//	                  -ERR <reason>\n          on failure
-//
-// Run:
-//
-//	go test -v -run TestFile
+// Run all:             go test -v -run TestFile
+// C server only:       TEST_FILE_SERVERS=../file-server go test -v -run TestFile
+// Rust server only:    TEST_FILE_SERVERS=../rust-file-server/target/debug/file-server-rs go test -v -run TestFile
+// Both (default):      go test -v -run TestFile
 package selectserver_test
 
 import (
@@ -26,24 +26,10 @@ import (
 	"time"
 )
 
-const (
-	fileBinary = "../file-server"
-	docroot    = "../docroot"
-)
-
-const (
-	portFileServe        = 19101
-	portFileSubdir       = 19102
-	portFileMultiReq     = 19103
-	portFileMissing      = 19104
-	portFileAbsPath      = 19105
-	portFilePathEscape   = 19106
-	portFileSimultaneous = 19107
-)
+const docroot = "../docroot"
 
 // ── protocol helpers ──────────────────────────────────────────────────────────
 
-// fileConn wraps a connection for the file-server protocol.
 type fileConn struct {
 	conn net.Conn
 	r    *bufio.Reader
@@ -64,28 +50,23 @@ func (fc *fileConn) Close() { fc.conn.Close() }
 // Body is nil for -ERR responses.
 func (fc *fileConn) Do(t *testing.T, filename string) (status string, body []byte) {
 	t.Helper()
-
 	fc.conn.SetWriteDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	if _, err := fmt.Fprintf(fc.conn, "%s\n", filename); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
-
 	fc.conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	line, err := fc.r.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read status: %v", err)
 	}
 	status = strings.TrimRight(line, "\r\n")
-
 	if !strings.HasPrefix(status, "+OK ") {
 		return status, nil
 	}
-
 	size, err := strconv.ParseInt(strings.TrimPrefix(status, "+OK "), 10, 64)
 	if err != nil {
 		t.Fatalf("bad size in %q: %v", status, err)
 	}
-
 	fc.conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
 	body = make([]byte, size)
 	if _, err := io.ReadFull(fc.r, body); err != nil {
@@ -94,17 +75,17 @@ func (fc *fileConn) Do(t *testing.T, filename string) (status string, body []byt
 	return status, body
 }
 
-// startFileServer resolves docroot to an absolute path and starts the server.
-func startFileServer(t *testing.T, port int) *exec.Cmd {
+// startFileServer resolves docroot and starts the given binary.
+func startFileServer(t *testing.T, binary string, port int) *exec.Cmd {
 	t.Helper()
 	abs, err := filepath.Abs(docroot)
 	if err != nil {
 		t.Fatalf("abs docroot: %v", err)
 	}
-	return startServer(t, fileBinary, port, abs)
+	return startServer(t, binary, port, abs)
 }
 
-// fixture reads a file from docroot and returns its contents.
+// fixture reads a file from docroot for comparison in tests.
 func fixture(t *testing.T, rel string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(docroot, rel))
@@ -114,148 +95,149 @@ func fixture(t *testing.T, rel string) []byte {
 	return b
 }
 
+// eachFileServer runs f as a parallel sub-test for every configured binary.
+// Sub-test names are the base filename of the binary, so output looks like:
+//
+//	--- PASS: TestFileServeFile/file-server (0.02s)
+//	--- PASS: TestFileServeFile/file-server-rs (0.02s)
+func eachFileServer(t *testing.T, f func(t *testing.T, port int)) {
+	t.Helper()
+	for _, bin := range fileServerBinaries() {
+		bin := bin
+		t.Run(serverLabel(bin), func(t *testing.T) {
+			t.Parallel()
+			port := nextPort()
+			cmd := startFileServer(t, bin, port)
+			defer stopServer(t, cmd)
+			f(t, port)
+		})
+	}
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-// TestFileServeFile: request a file and verify the content matches the disk.
+// TestFileServeFile: request a file; content must match the file on disk.
 func TestFileServeFile(t *testing.T) {
-	cmd := startFileServer(t, portFileServe)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFileServe)
-	defer c.Close()
-
-	status, got := c.Do(t, "hello.txt")
-	if !strings.HasPrefix(status, "+OK") {
-		t.Fatalf("expected +OK, got %q", status)
-	}
-	if string(got) != string(fixture(t, "hello.txt")) {
-		t.Error("content mismatch")
-	}
+	eachFileServer(t, func(t *testing.T, port int) {
+		c := newFileConn(t, port)
+		defer c.Close()
+		status, got := c.Do(t, "hello.txt")
+		if !strings.HasPrefix(status, "+OK") {
+			t.Fatalf("expected +OK, got %q", status)
+		}
+		if string(got) != string(fixture(t, "hello.txt")) {
+			t.Error("content mismatch")
+		}
+	})
 }
 
 // TestFileServeSubdirFile: files inside subdirectories must be reachable.
 func TestFileServeSubdirFile(t *testing.T) {
-	cmd := startFileServer(t, portFileSubdir)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFileSubdir)
-	defer c.Close()
-
-	status, got := c.Do(t, "subdir/nested.txt")
-	if !strings.HasPrefix(status, "+OK") {
-		t.Fatalf("expected +OK, got %q", status)
-	}
-	if string(got) != string(fixture(t, "subdir/nested.txt")) {
-		t.Error("content mismatch")
-	}
+	eachFileServer(t, func(t *testing.T, port int) {
+		c := newFileConn(t, port)
+		defer c.Close()
+		status, got := c.Do(t, "subdir/nested.txt")
+		if !strings.HasPrefix(status, "+OK") {
+			t.Fatalf("expected +OK, got %q", status)
+		}
+		if string(got) != string(fixture(t, "subdir/nested.txt")) {
+			t.Error("content mismatch")
+		}
+	})
 }
 
-// TestFileMultipleRequestsSameConn: two file requests on one connection.
-// Tests that +OK framing is correct — second read starts after the first body.
+// TestFileMultipleRequestsSameConn: two requests on one connection.
+// Verifies that +OK <size> framing is correct across consecutive requests.
 func TestFileMultipleRequestsSameConn(t *testing.T) {
-	cmd := startFileServer(t, portFileMultiReq)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFileMultiReq)
-	defer c.Close()
-
-	for _, name := range []string{"hello.txt", "pangrams.txt"} {
-		status, got := c.Do(t, name)
-		if !strings.HasPrefix(status, "+OK") {
-			t.Fatalf("[%s] expected +OK, got %q", name, status)
+	eachFileServer(t, func(t *testing.T, port int) {
+		c := newFileConn(t, port)
+		defer c.Close()
+		for _, name := range []string{"hello.txt", "pangrams.txt"} {
+			status, got := c.Do(t, name)
+			if !strings.HasPrefix(status, "+OK") {
+				t.Fatalf("[%s] expected +OK, got %q", name, status)
+			}
+			if string(got) != string(fixture(t, name)) {
+				t.Errorf("[%s] content mismatch", name)
+			}
 		}
-		if string(got) != string(fixture(t, name)) {
-			t.Errorf("[%s] content mismatch", name)
-		}
-	}
+	})
 }
 
 // TestFileMissingFile: a non-existent file must return -ERR.
 func TestFileMissingFile(t *testing.T) {
-	cmd := startFileServer(t, portFileMissing)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFileMissing)
-	defer c.Close()
-
-	status, _ := c.Do(t, "does-not-exist.txt")
-	if !strings.HasPrefix(status, "-ERR") {
-		t.Errorf("expected -ERR, got %q", status)
-	}
+	eachFileServer(t, func(t *testing.T, port int) {
+		c := newFileConn(t, port)
+		defer c.Close()
+		status, _ := c.Do(t, "does-not-exist.txt")
+		if !strings.HasPrefix(status, "-ERR") {
+			t.Errorf("expected -ERR, got %q", status)
+		}
+	})
 }
 
 // TestFileAbsolutePathRejected: requests starting with '/' must be rejected.
 func TestFileAbsolutePathRejected(t *testing.T) {
-	cmd := startFileServer(t, portFileAbsPath)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFileAbsPath)
-	defer c.Close()
-
-	status, _ := c.Do(t, "/etc/passwd")
-	if !strings.HasPrefix(status, "-ERR") {
-		t.Errorf("expected -ERR for absolute path, got %q", status)
-	}
+	eachFileServer(t, func(t *testing.T, port int) {
+		c := newFileConn(t, port)
+		defer c.Close()
+		status, _ := c.Do(t, "/etc/passwd")
+		if !strings.HasPrefix(status, "-ERR") {
+			t.Errorf("expected -ERR for absolute path, got %q", status)
+		}
+	})
 }
 
 // TestFilePathEscapeRejected: "../" traversal must not escape the docroot.
 func TestFilePathEscapeRejected(t *testing.T) {
-	cmd := startFileServer(t, portFilePathEscape)
-	defer stopServer(t, cmd)
-
-	c := newFileConn(t, portFilePathEscape)
-	defer c.Close()
-
-	escapes := []string{
-		"../../etc/passwd",
-		"../file-server.c",
-		"../file-server",
-		"subdir/../../file-server.c",
-	}
-	for _, path := range escapes {
-		status, _ := c.Do(t, path)
-		if !strings.HasPrefix(status, "-ERR") {
-			t.Errorf("escape %q was NOT rejected, got %q", path, status)
+	eachFileServer(t, func(t *testing.T, port int) {
+		for _, path := range []string{
+			"../../etc/passwd",
+			"../file-server.c",
+			"../file-server",
+			"subdir/../../file-server.c",
+		} {
+			c := newFileConn(t, port)
+			status, _ := c.Do(t, path)
+			c.Close()
+			if !strings.HasPrefix(status, "-ERR") {
+				t.Errorf("escape %q not rejected: got %q", path, status)
+			}
 		}
-	}
+	})
 }
 
 // TestFileSimultaneousReads: 20 concurrent clients fetch different files.
-// The event loop must interleave correctly and return exact content to each client.
 func TestFileSimultaneousReads(t *testing.T) {
-	const numClients = 20
-	cmd := startFileServer(t, portFileSimultaneous)
-	defer stopServer(t, cmd)
+	eachFileServer(t, func(t *testing.T, port int) {
+		files := []string{"hello.txt", "pangrams.txt", "subdir/nested.txt"}
+		wants := make(map[string][]byte, len(files))
+		for _, f := range files {
+			wants[f] = fixture(t, f)
+		}
 
-	files := []string{"hello.txt", "pangrams.txt", "subdir/nested.txt"}
-	wants := make(map[string][]byte, len(files))
-	for _, f := range files {
-		wants[f] = fixture(t, f)
-	}
+		const n = 20
+		var wg sync.WaitGroup
+		errs := make(chan string, n)
 
-	var wg sync.WaitGroup
-	errs := make(chan string, numClients)
-
-	for i := range numClients {
-		wg.Go(func() {
-			name := files[i%len(files)]
-
-			c := newFileConn(t, portFileSimultaneous)
-			defer c.Close()
-
-			status, got := c.Do(t, name)
-			switch {
-			case !strings.HasPrefix(status, "+OK"):
-				errs <- fmt.Sprintf("client %d [%s]: %q", i, name, status)
-			case string(got) != string(wants[name]):
-				errs <- fmt.Sprintf("client %d [%s]: content mismatch", i, name)
-			}
-		})
-	}
-
-	wg.Wait()
-	close(errs)
-	for msg := range errs {
-		t.Error(msg)
-	}
+		for i := range n {
+			wg.Go(func() {
+				name := files[i%len(files)]
+				c := newFileConn(t, port)
+				defer c.Close()
+				status, got := c.Do(t, name)
+				switch {
+				case !strings.HasPrefix(status, "+OK"):
+					errs <- fmt.Sprintf("client %d [%s]: %q", i, name, status)
+				case string(got) != string(wants[name]):
+					errs <- fmt.Sprintf("client %d [%s]: content mismatch", i, name)
+				}
+			})
+		}
+		wg.Wait()
+		close(errs)
+		for msg := range errs {
+			t.Error(msg)
+		}
+	})
 }

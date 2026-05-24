@@ -1,4 +1,22 @@
-// Shared test helpers for both select-server and file-server tests.
+// Shared test helpers.
+//
+// Port allocation
+// ---------------
+// Tests use nextPort() instead of hardcoded constants so that subtests that
+// run in parallel (t.Parallel) never collide.
+//
+// Server selection
+// ----------------
+// File-server tests are parameterised over a list of server binaries.
+// By default both the C and Rust implementations are tested.
+// Override with the TEST_FILE_SERVERS environment variable:
+//
+//   TEST_FILE_SERVERS=./file-server               go test ./...   # C only
+//   TEST_FILE_SERVERS=./file-server,./rust-bin    go test ./...   # both
+//
+// Similarly, the time-server (select-server) list can be overridden with
+// TEST_TIME_SERVERS (defaults to the single C implementation).
+
 package selectserver_test
 
 import (
@@ -7,14 +25,52 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// startServer launches the given binary on port, waits until the port accepts
-// connections (up to 1 s), and returns the running *exec.Cmd.
-// Pass extra arguments (e.g. docroot) via extraArgs.
+// ── port allocator ────────────────────────────────────────────────────────────
+
+var portSeed atomic.Int32
+
+func init() { portSeed.Store(19000) }
+
+// nextPort returns a unique TCP port for each caller.
+func nextPort() int { return int(portSeed.Add(1)) }
+
+// ── binary lists ──────────────────────────────────────────────────────────────
+
+// fileServerBinaries returns the list of file-server binaries to test.
+func fileServerBinaries() []string {
+	if v := os.Getenv("TEST_FILE_SERVERS"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{
+		"../file-server",
+		"../rust-file-server/target/debug/file-server-rs",
+	}
+}
+
+// timeServerBinaries returns the list of time-server binaries to test.
+func timeServerBinaries() []string {
+	if v := os.Getenv("TEST_TIME_SERVERS"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{"../select-server"}
+}
+
+// serverLabel returns a short human-readable name used in t.Run sub-test names.
+func serverLabel(binary string) string {
+	return filepath.Base(binary)
+}
+
+// ── server lifecycle ──────────────────────────────────────────────────────────
+
+// startServer launches binary on port (with optional extra args), waits up to
+// 1 s for the port to be ready, and returns the running *exec.Cmd.
 func startServer(t *testing.T, binary string, port int, extraArgs ...string) *exec.Cmd {
 	t.Helper()
 	args := append([]string{fmt.Sprintf("%d", port)}, extraArgs...)
@@ -49,6 +105,8 @@ func stopServer(t *testing.T, cmd *exec.Cmd) {
 	cmd.Wait()                       //nolint:errcheck
 }
 
+// ── raw TCP helpers ───────────────────────────────────────────────────────────
+
 // dial opens a TCP connection and returns it with a buffered reader/writer.
 func dial(t *testing.T, port int) (net.Conn, *bufio.Reader, *bufio.Writer) {
 	t.Helper()
@@ -70,7 +128,7 @@ func sendLine(t *testing.T, w *bufio.Writer, line string) {
 	}
 }
 
-// readLine reads one response line (strips trailing \r\n) using a 2 s deadline.
+// readLine reads one response line (strips trailing \r\n) with a 2 s deadline.
 func readLine(t *testing.T, conn net.Conn, r *bufio.Reader) string {
 	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
@@ -81,8 +139,7 @@ func readLine(t *testing.T, conn net.Conn, r *bufio.Reader) string {
 	return strings.TrimRight(line, "\r\n")
 }
 
-// readLineFromConn wraps conn in a fresh bufio.Reader and reads one line.
-// Use this when you already hold the conn but haven't created a bufio.Reader yet.
+// readLineFromConn wraps an existing conn in a fresh bufio.Reader and reads one line.
 func readLineFromConn(t *testing.T, conn net.Conn) string {
 	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
