@@ -17,7 +17,7 @@
 // Similarly, the time-server (select-server) list can be overridden with
 // TEST_TIME_SERVERS (defaults to the single C implementation).
 
-package selectserver_test
+package selectserver
 
 import (
 	"bufio"

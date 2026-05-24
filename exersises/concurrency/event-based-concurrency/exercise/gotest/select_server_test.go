@@ -3,7 +3,7 @@
 // Run all:          go test -v -run TestTime
 // Run one test:     go test -v -run TestTimePartial
 // C server only:    TEST_TIME_SERVERS=../select-server go test -v -run TestTime
-package selectserver_test
+package selectserver
 
 import (
 	"fmt"

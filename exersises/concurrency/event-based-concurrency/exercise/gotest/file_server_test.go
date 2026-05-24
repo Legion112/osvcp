@@ -1,15 +1,16 @@
 // Tests for the file-server (Exercise 3).
 //
 // Protocol:
-//   Client → Server:  <relative-filename>\n
-//   Server → Client:  +OK <size>\n<content>   on success
-//                     -ERR <reason>\n          on failure
+//
+//	Client → Server:  <relative-filename>\n
+//	Server → Client:  +OK <size>\n<content>   on success
+//	                  -ERR <reason>\n          on failure
 //
 // Run all:             go test -v -run TestFile
 // C server only:       TEST_FILE_SERVERS=../file-server go test -v -run TestFile
 // Rust server only:    TEST_FILE_SERVERS=../rust-file-server/target/debug/file-server-rs go test -v -run TestFile
 // Both (default):      go test -v -run TestFile
-package selectserver_test
+package selectserver
 
 import (
 	"bufio"
