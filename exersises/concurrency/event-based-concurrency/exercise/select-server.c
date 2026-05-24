@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -37,7 +38,7 @@
 #include <signal.h>
 
 #define DEFAULT_PORT  8081
-#define BACKLOG       16
+#define BACKLOG       128       /* kernel listen queue; keep >= MAX_CLIENTS    */
 #define MAX_CLIENTS   64        /* must stay below FD_SETSIZE (typically 1024) */
 #define REQ_BUF_SIZE  512
 
@@ -70,12 +71,17 @@ static void current_time_str(char *out, size_t len) {
     strftime(out, len, "%Y-%m-%d %H:%M:%S", localtime(&now));
 }
 
+/* Create, bind, listen, and set O_NONBLOCK on a TCP socket. */
 static int create_listen_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); exit(EXIT_FAILURE); }
 
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* Non-blocking so the accept() drain loop terminates on EAGAIN. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
@@ -189,15 +195,22 @@ static void event_loop(int listen_fd) {
 
         /* --- Step 3: check which fds select() marked as ready. --- */
 
-        /* New incoming connection? */
+        /* New incoming connection(s)?
+         * When listen_fd is readable, the kernel may have queued more than
+         * one SYN. Drain all pending accepts in one pass so a burst of
+         * simultaneous clients doesn't stall in the kernel backlog.        */
         if (FD_ISSET(listen_fd, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t addr_len = sizeof(client_addr);
-            int client_fd = accept(listen_fd,
-                                   (struct sockaddr *)&client_addr, &addr_len);
-            if (client_fd < 0) {
-                if (errno != EINTR) perror("accept");
-            } else {
+            while (1) {
+                struct sockaddr_in client_addr;
+                socklen_t addr_len = sizeof(client_addr);
+                int client_fd = accept(listen_fd,
+                                       (struct sockaddr *)&client_addr, &addr_len);
+                if (client_fd < 0) {
+                    /* EAGAIN/EWOULDBLOCK: no more connections queued.      */
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                        perror("accept");
+                    break;
+                }
                 add_client(client_fd, &client_addr);
             }
         }
