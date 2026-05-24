@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -114,6 +115,24 @@ func eachFileServer(t *testing.T, f func(t *testing.T, port int)) {
 				stopServer(t, cmd)
 			})
 			f(t, port)
+		})
+	}
+}
+
+// eachFileServerWithCmd is like eachFileServer but also passes the server
+// *exec.Cmd so tests can send signals (e.g. SIGUSR1 to flush the cache).
+func eachFileServerWithCmd(t *testing.T, f func(t *testing.T, port int, cmd *exec.Cmd)) {
+	t.Helper()
+	for _, bin := range fileServerBinaries() {
+		bin := bin
+		t.Run(serverLabel(bin), func(t *testing.T) {
+			t.Parallel()
+			port := nextPort()
+			cmd := startFileServer(t, bin, port)
+			t.Cleanup(func() {
+				stopServer(t, cmd)
+			})
+			f(t, port, cmd)
 		})
 	}
 }
@@ -242,6 +261,71 @@ func TestFileSimultaneousReads(t *testing.T) {
 		close(errs)
 		for msg := range errs {
 			t.Error(msg)
+		}
+	})
+}
+
+// TestFileCacheInvalidation verifies that:
+//  1. A file served once is cached (second fetch returns stale content after
+//     the file is overwritten on disk).
+//  2. Sending SIGUSR1 flushes the cache so the next fetch reads fresh content.
+func TestFileCacheInvalidation(t *testing.T) {
+	eachFileServerWithCmd(t, func(t *testing.T, port int, cmd *exec.Cmd) {
+		// Create a uniquely named temp file inside docroot.
+		tmpName := fmt.Sprintf("cache-test-%d.txt", port)
+		tmpPath := filepath.Join(docroot, tmpName)
+		const v1 = "version-one\n"
+		const v2 = "version-two\n"
+
+		if err := os.WriteFile(tmpPath, []byte(v1), 0o644); err != nil {
+			t.Fatalf("create temp file: %v", err)
+		}
+		t.Cleanup(func() { os.Remove(tmpPath) }) //nolint:errcheck
+
+		fc := newFileConn(t, port)
+		defer fc.Close()
+
+		// 1. First fetch — populates the cache.
+		status, got := fc.Do(t, tmpName)
+		if !strings.HasPrefix(status, "+OK") {
+			t.Fatalf("first fetch: %q", status)
+		}
+		if string(got) != v1 {
+			t.Fatalf("first fetch: got %q, want %q", got, v1)
+		}
+
+		// 2. Overwrite the file on disk.
+		if err := os.WriteFile(tmpPath, []byte(v2), 0o644); err != nil {
+			t.Fatalf("overwrite file: %v", err)
+		}
+
+		// 3. Second fetch — must return stale (v1) content from cache.
+		status, got = fc.Do(t, tmpName)
+		if !strings.HasPrefix(status, "+OK") {
+			t.Fatalf("second fetch: %q", status)
+		}
+		if string(got) != v1 {
+			// The server does not cache (served updated content immediately).
+			// This is not necessarily wrong for a non-caching implementation,
+			// but all our servers implement the cache, so treat it as a failure.
+			t.Errorf("second fetch: got %q, want cached %q (cache not working?)", got, v1)
+			return
+		}
+
+		// 4. Send SIGUSR1 to flush the server's cache.
+		if err := cmd.Process.Signal(syscall.SIGUSR1); err != nil {
+			t.Fatalf("send SIGUSR1: %v", err)
+		}
+		// Give the server a moment to process the signal in its event loop.
+		time.Sleep(100 * time.Millisecond)
+
+		// 5. Third fetch — cache is empty; server must re-read from disk.
+		status, got = fc.Do(t, tmpName)
+		if !strings.HasPrefix(status, "+OK") {
+			t.Fatalf("third fetch: %q", status)
+		}
+		if string(got) != v2 {
+			t.Errorf("third fetch (after SIGUSR1): got %q, want %q (cache not cleared?)", got, v2)
 		}
 	})
 }
