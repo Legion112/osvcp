@@ -38,6 +38,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -250,6 +252,71 @@ func BenchmarkFileCacheHitVsMiss(b *testing.B) {
 				for b.Loop() {
 					bc.request(b, benchLargeFile)
 				}
+			})
+		})
+	}
+}
+
+// BenchmarkConcurrencyScaling sweeps from 1 to 32 concurrent persistent
+// connections and reports aggregate throughput (ns/op and MB/s) for each
+// server at each concurrency level.
+//
+// Running this benchmark reveals the crossover point at which an async server
+// starts outperforming a synchronous one:
+//
+//	go test -bench=BenchmarkConcurrencyScaling -benchmem -benchtime=3s -run='^$'
+//
+// Expected pattern
+// ────────────────
+//
+//	concurrency=1   → sync C wins  (lower async overhead)
+//	concurrency=4   → roughly equal
+//	concurrency≥8   → Tokio pulls ahead and keeps scaling
+//	concurrency≥32  → select()-based servers plateau (single-threaded limit)
+//
+// The C select() and Rust select() servers are single-threaded: every
+// connection competes for the same event-loop iteration.  Throughput
+// saturates around 1 CPU core worth of work.
+//
+// Tokio uses a work-stealing multi-threaded scheduler (one OS thread per
+// logical CPU), so throughput keeps climbing until all cores are busy.
+func BenchmarkConcurrencyScaling(b *testing.B) {
+	for _, clients := range []int{1, 4, 8, 16, 32} {
+		clients := clients
+		b.Run(fmt.Sprintf("%02d-clients", clients), func(b *testing.B) {
+			benchEachServer(b, func(b *testing.B, port int) {
+				// Pre-connect all clients before starting the timer.
+				conns := make([]*benchConn, clients)
+				for i := range conns {
+					conns[i] = newBenchConn(b, port)
+				}
+				defer func() {
+					for _, c := range conns {
+						c.close()
+					}
+				}()
+
+				b.SetBytes(int64(len(fixture(b, benchSmallFile))))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				// Distribute b.N requests among `clients` goroutines.
+				// Each goroutine owns exactly one connection so there is
+				// no cross-connection locking or head-of-line blocking.
+				var remaining atomic.Int64
+				remaining.Store(int64(b.N))
+				var wg sync.WaitGroup
+				for _, c := range conns {
+					c := c
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						for remaining.Add(-1) >= 0 {
+							c.request(b, benchSmallFile)
+						}
+					}()
+				}
+				wg.Wait()
 			})
 		})
 	}
