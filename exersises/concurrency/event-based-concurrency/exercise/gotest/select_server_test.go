@@ -110,12 +110,12 @@ func assertTimeResponse(t *testing.T, got string) {
 
 // Each test uses a distinct port so they can run in parallel without conflict.
 const (
-	portSingleRequest         = 19001
-	portMultipleRequestsSame  = 19002
-	portSimultaneousClients   = 19003
-	portPartialLineBuffering  = 19004
-	portAbruptDisconnect      = 19005
-	portRapidFireClients      = 19006
+	portSingleRequest        = 19001
+	portMultipleRequestsSame = 19002
+	portSimultaneousClients  = 19003
+	portPartialLineBuffering = 19004
+	portAbruptDisconnect     = 19005
+	portRapidFireClients     = 19006
 )
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -158,9 +158,8 @@ func TestSimultaneousClients(t *testing.T) {
 	errs := make(chan string, numClients)
 
 	for i := 0; i < numClients; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+		id := i
+		wg.Go(func() {
 			time.Sleep(time.Duration(id*5) * time.Millisecond) // stagger slightly
 
 			conn, r, w := dial(t, portSimultaneousClients)
@@ -171,7 +170,7 @@ func TestSimultaneousClients(t *testing.T) {
 			if !timePattern.MatchString(resp) {
 				errs <- fmt.Sprintf("client %d got %q", id, resp)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -246,10 +245,8 @@ func TestRapidFireClients(t *testing.T) {
 	errs := make(chan string, numClients)
 
 	for i := 0; i < numClients; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-
+		id := i
+		wg.Go(func() {
 			conn, r, w := dial(t, portRapidFireClients)
 			defer conn.Close()
 
@@ -258,7 +255,7 @@ func TestRapidFireClients(t *testing.T) {
 			if !timePattern.MatchString(resp) {
 				errs <- fmt.Sprintf("client %d got %q", id, resp)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
