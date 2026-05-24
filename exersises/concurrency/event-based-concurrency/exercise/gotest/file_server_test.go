@@ -37,11 +37,11 @@ type fileConn struct {
 	r    *bufio.Reader
 }
 
-func newFileConn(t *testing.T, port int) *fileConn {
-	t.Helper()
+func newFileConn(tb testing.TB, port int) *fileConn {
+	tb.Helper()
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		tb.Fatalf("dial: %v", err)
 	}
 	return &fileConn{conn: c, r: bufio.NewReader(c)}
 }
@@ -50,16 +50,16 @@ func (fc *fileConn) Close() { fc.conn.Close() }
 
 // Do sends a file request and returns (statusLine, body).
 // Body is nil for -ERR responses.
-func (fc *fileConn) Do(t *testing.T, filename string) (status string, body []byte) {
-	t.Helper()
+func (fc *fileConn) Do(tb testing.TB, filename string) (status string, body []byte) {
+	tb.Helper()
 	fc.conn.SetWriteDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	if _, err := fmt.Fprintf(fc.conn, "%s\n", filename); err != nil {
-		t.Fatalf("write request: %v", err)
+		tb.Fatalf("write request: %v", err)
 	}
 	fc.conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	line, err := fc.r.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read status: %v", err)
+		tb.Fatalf("read status: %v", err)
 	}
 	status = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(status, "+OK ") {
@@ -67,33 +67,33 @@ func (fc *fileConn) Do(t *testing.T, filename string) (status string, body []byt
 	}
 	size, err := strconv.ParseInt(strings.TrimPrefix(status, "+OK "), 10, 64)
 	if err != nil {
-		t.Fatalf("bad size in %q: %v", status, err)
+		tb.Fatalf("bad size in %q: %v", status, err)
 	}
 	fc.conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
 	body = make([]byte, size)
 	if _, err := io.ReadFull(fc.r, body); err != nil {
-		t.Fatalf("read body: %v", err)
+		tb.Fatalf("read body: %v", err)
 	}
 	fmt.Fprint(os.Stderr, string(body))
 	return status, body
 }
 
 // startFileServer resolves docroot and starts the given binary.
-func startFileServer(t *testing.T, binary string, port int) *exec.Cmd {
-	t.Helper()
+func startFileServer(tb testing.TB, binary string, port int) *exec.Cmd {
+	tb.Helper()
 	abs, err := filepath.Abs(docroot)
 	if err != nil {
-		t.Fatalf("abs docroot: %v", err)
+		tb.Fatalf("abs docroot: %v", err)
 	}
-	return startServer(t, binary, port, abs)
+	return startServer(tb, binary, port, abs)
 }
 
 // fixture reads a file from docroot for comparison in tests.
-func fixture(t *testing.T, rel string) []byte {
-	t.Helper()
+func fixture(tb testing.TB, rel string) []byte {
+	tb.Helper()
 	b, err := os.ReadFile(filepath.Join(docroot, rel))
 	if err != nil {
-		t.Fatalf("read fixture %s: %v", rel, err)
+		tb.Fatalf("read fixture %s: %v", rel, err)
 	}
 	return b
 }

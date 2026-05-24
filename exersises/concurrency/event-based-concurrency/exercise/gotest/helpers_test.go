@@ -11,8 +11,8 @@
 // By default both the C and Rust implementations are tested.
 // Override with the TEST_FILE_SERVERS environment variable:
 //
-//   TEST_FILE_SERVERS=./file-server               go test ./...   # C only
-//   TEST_FILE_SERVERS=./file-server,./rust-bin    go test ./...   # both
+//	TEST_FILE_SERVERS=./file-server               go test ./...   # C only
+//	TEST_FILE_SERVERS=./file-server,./rust-bin    go test ./...   # both
 //
 // Similarly, the time-server (select-server) list can be overridden with
 // TEST_TIME_SERVERS (defaults to the single C implementation).
@@ -32,6 +32,20 @@ import (
 	"time"
 )
 
+// devnull returns an *os.File pointing to /dev/null for writing.
+// It is used to ensure child-process stdout/stderr are silenced without
+// inheriting the parent's file descriptors (which in some environments,
+// e.g. Cursor IDE, are sockets rather than a terminal or pipe).
+func devnull(tb testing.TB) *os.File {
+	tb.Helper()
+	f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		tb.Fatalf("open /dev/null: %v", err)
+	}
+	tb.Cleanup(func() { f.Close() })
+	return f
+}
+
 // ── port allocator ────────────────────────────────────────────────────────────
 
 var portSeed atomic.Int32
@@ -44,11 +58,6 @@ func nextPort() int { return int(portSeed.Add(1)) }
 // ── binary lists ──────────────────────────────────────────────────────────────
 
 // fileServerBinaries returns the list of file-server binaries to test.
-// Includes the original select()-based versions and the new async versions:
-//   - file-server:         C select() + blocking I/O  (exercise 3)
-//   - file-server-rs:      Rust select() + blocking I/O  (exercise 3)
-//   - aio-file-server:     C select() + POSIX aio_read()  (exercise 4)
-//   - file-server-tokio:   Rust tokio async/await  (exercise 4)
 func fileServerBinaries() []string {
 	if v := os.Getenv("TEST_FILE_SERVERS"); v != "" {
 		return strings.Split(v, ",")
@@ -98,20 +107,32 @@ func serverStderr() *os.File {
 
 // startServer launches binary on port (with optional extra args), waits up to
 // 1 s for the port to be ready, and returns the running *exec.Cmd.
-func startServer(t *testing.T, binary string, port int, extraArgs ...string) *exec.Cmd {
-	t.Helper()
+//
+// Accepts testing.TB so it can be used from both *testing.T and *testing.B.
+func startServer(tb testing.TB, binary string, port int, extraArgs ...string) *exec.Cmd {
+	tb.Helper()
 	args := append([]string{fmt.Sprintf("%d", port)}, extraArgs...)
 	cmd := exec.Command(binary, args...)
 	// Route child stdout/stderr to os.Stderr only when TEST_VERBOSE_SERVERS=1.
-	// Default is nil (→ /dev/null, no pipe, no goroutine).
-	// io.Discard creates a goroutine+pipe that fills under heavy server logging.
-	// os.Stderr goes to GoLand's PTY whose tiny kernel buffer (~4 KB) fills
-	// just as fast, blocking every server on printf and deadlocking the test.
-	out := os.Stderr
+	// In all other cases use an explicit /dev/null file.
+	//
+	// Why not just pass nil?  In the Cursor IDE (and similar environments) the
+	// parent test process has *sockets* as fd 1 / fd 2 rather than a pipe or
+	// terminal.  Go's exec.Cmd with nil Stdout/Stderr inherits the parent's
+	// file descriptors for stdout/stderr in that situation.  When the child C
+	// server then calls printf()/fprintf(stderr, ...) it accidentally writes to
+	// the inherited socket, corrupting the benchmark client's read stream.
+	// Passing an explicit devnull *os.File forces the child to use /dev/null.
+	var out *os.File
+	if serverStderr() != nil {
+		out = serverStderr()
+	} else {
+		out = devnull(tb)
+	}
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start %s: %v", binary, err)
+		tb.Fatalf("start %s: %v", binary, err)
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -125,21 +146,18 @@ func startServer(t *testing.T, binary string, port int, extraArgs ...string) *ex
 		time.Sleep(20 * time.Millisecond)
 	}
 	cmd.Process.Kill() //nolint:errcheck
-	t.Fatalf("%s on port %d not ready within 1 s", binary, port)
+	tb.Fatalf("%s on port %d not ready within 1 s", binary, port)
 	return nil
 }
 
-func stopServer(t *testing.T, cmd *exec.Cmd) {
-	t.Helper()
+func stopServer(tb testing.TB, cmd *exec.Cmd) {
+	tb.Helper()
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	cmd.Process.Signal(os.Interrupt) //nolint:errcheck
 
 	// Give the server up to 2 s to exit gracefully after SIGINT, then SIGKILL.
-	// Without a timeout, a server that ignores SIGINT (e.g. a Tokio process
-	// that absorbs the signal internally without a ctrl_c() consumer) would
-	// leave cmd.Wait() blocked forever, hanging the test goroutine.
 	done := make(chan struct{})
 	go func() { cmd.Wait(); close(done) }() //nolint:errcheck
 	select {
@@ -153,45 +171,45 @@ func stopServer(t *testing.T, cmd *exec.Cmd) {
 // ── raw TCP helpers ───────────────────────────────────────────────────────────
 
 // dial opens a TCP connection and returns it with a buffered reader/writer.
-func dial(t *testing.T, port int) (net.Conn, *bufio.Reader, *bufio.Writer) {
-	t.Helper()
+func dial(tb testing.TB, port int) (net.Conn, *bufio.Reader, *bufio.Writer) {
+	tb.Helper()
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		tb.Fatalf("dial: %v", err)
 	}
 	return c, bufio.NewReader(c), bufio.NewWriter(c)
 }
 
 // sendLine writes "line\n" and flushes.
-func sendLine(t *testing.T, w *bufio.Writer, line string) {
-	t.Helper()
+func sendLine(tb testing.TB, w *bufio.Writer, line string) {
+	tb.Helper()
 	if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-		t.Fatalf("write: %v", err)
+		tb.Fatalf("write: %v", err)
 	}
 	if err := w.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
+		tb.Fatalf("flush: %v", err)
 	}
 }
 
 // readLine reads one response line (strips trailing \r\n) with a 2 s deadline.
-func readLine(t *testing.T, conn net.Conn, r *bufio.Reader) string {
-	t.Helper()
+func readLine(tb testing.TB, conn net.Conn, r *bufio.Reader) string {
+	tb.Helper()
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	line, err := r.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		tb.Fatalf("read: %v", err)
 	}
 	return strings.TrimRight(line, "\r\n")
 }
 
 // readLineFromConn wraps an existing conn in a fresh bufio.Reader and reads one line.
-func readLineFromConn(t *testing.T, conn net.Conn) string {
-	t.Helper()
+func readLineFromConn(tb testing.TB, conn net.Conn) string {
+	tb.Helper()
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 	r := bufio.NewReader(conn)
 	line, err := r.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		tb.Fatalf("read: %v", err)
 	}
 	return strings.TrimRight(line, "\r\n")
 }
