@@ -18,6 +18,10 @@
  *   • Absolute paths in requests are rejected immediately.
  *   • Only regular files are served (no directories, devices, etc.).
  *
+ * File cache (exercise 5):
+ *   • A small in-process LRU-like cache stores recently served files.
+ *   • Sending SIGUSR1 flushes the entire cache (administrative action).
+ *
  * Usage:
  *   ./file-server [port [docroot]]
  *   Default port:    8082
@@ -26,6 +30,7 @@
  * Example:
  *   ./file-server 8082 ./docroot
  *   echo "hello.txt" | nc localhost 8082
+ *   kill -USR1 <pid>    # flush cache
  */
 
 #include <stdio.h>
@@ -49,10 +54,81 @@
 #define REQ_BUF_SIZE    512
 #define FILE_BUF_SIZE   4096
 
-static volatile int running = 1;
-static char docroot[PATH_MAX];  /* canonical absolute path of the serve root */
+/* ── file cache constants ──────────────────────────────────────────────────── */
 
-static void handle_sigint(int sig) { (void)sig; running = 0; }
+#define MAX_CACHE_ENTRIES   16
+#define MAX_CACHE_FILE_SIZE (64 * 1024)   /* do not cache files larger than 64 KB */
+
+/* ── globals ───────────────────────────────────────────────────────────────── */
+
+static volatile int            running              = 1;
+static volatile sig_atomic_t   cache_clear_requested = 0;
+static char                    docroot[PATH_MAX];
+
+static void handle_sigint(int sig)   { (void)sig; running = 0; }
+static void handle_sigusr1(int sig)  { (void)sig; cache_clear_requested = 1; }
+
+/* ── file cache ────────────────────────────────────────────────────────────── */
+
+/*
+ * Each entry stores the full pre-built response: "+OK <n>\n" + file bytes.
+ * Sending from cache is a single write_all() call — no disk I/O.
+ *
+ * Eviction policy: FIFO.  When the table is full the oldest entry (index 0)
+ * is freed and the rest shift down by one slot.
+ *
+ * Thread-safety: the server is single-threaded so no locking is needed.
+ * The signal handler only sets a flag; the actual cache clear happens in the
+ * main loop body, never inside the handler.
+ */
+typedef struct {
+    char   key[PATH_MAX]; /* resolved canonical path of the file      */
+    char  *resp;          /* malloc'd buffer: header + file content   */
+    size_t resp_size;     /* total bytes in resp                      */
+} CacheEntry;
+
+static CacheEntry cache[MAX_CACHE_ENTRIES];
+static int        cache_size = 0;
+
+static CacheEntry *cache_lookup(const char *key) {
+    for (int i = 0; i < cache_size; i++)
+        if (strcmp(cache[i].key, key) == 0)
+            return &cache[i];
+    return NULL;
+}
+
+/* Takes ownership of resp on success. */
+static void cache_insert(const char *key, char *resp, size_t resp_size) {
+    /* Update in-place if the key already exists. */
+    for (int i = 0; i < cache_size; i++) {
+        if (strcmp(cache[i].key, key) == 0) {
+            free(cache[i].resp);
+            cache[i].resp      = resp;
+            cache[i].resp_size = resp_size;
+            return;
+        }
+    }
+    /* Evict the oldest entry (index 0) when the table is full. */
+    if (cache_size == MAX_CACHE_ENTRIES) {
+        free(cache[0].resp);
+        memmove(cache, cache + 1, sizeof(CacheEntry) * (MAX_CACHE_ENTRIES - 1));
+        cache_size--;
+    }
+    strncpy(cache[cache_size].key, key, PATH_MAX - 1);
+    cache[cache_size].key[PATH_MAX - 1] = '\0';
+    cache[cache_size].resp      = resp;
+    cache[cache_size].resp_size = resp_size;
+    cache_size++;
+}
+
+static void cache_clear(void) {
+    for (int i = 0; i < cache_size; i++) {
+        free(cache[i].resp);
+        cache[i].resp = NULL;
+    }
+    cache_size = 0;
+    fprintf(stderr, "[cache] cleared (%d entries flushed)\n", cache_size);
+}
 
 /* ── per-connection state ──────────────────────────────────────────────────── */
 typedef struct {
@@ -138,6 +214,11 @@ static void send_error(int fd, const char *reason) {
  *
  * filename: the raw string the client sent (not yet validated).
  * Returns 0 on success, -1 if the connection should be closed.
+ *
+ * Cache behaviour:
+ *   Hit  → send pre-built resp from cache; no disk I/O.
+ *   Miss → read file, build full response, insert into cache, send.
+ *   Large file (> MAX_CACHE_FILE_SIZE) → stream without caching.
  */
 static int serve_file(Client *c, const char *filename) {
     /* ── Security check 1: reject empty names and absolute paths ── */
@@ -157,18 +238,22 @@ static int serve_file(Client *c, const char *filename) {
 
     char resolved[PATH_MAX];
     if (realpath(candidate, resolved) == NULL) {
-        /* File doesn't exist or can't be resolved. */
         send_error(c->fd, "not found");
-        printf("[%s:%d] not found: %s\n", c->ip, c->port, filename);
         return 0;
     }
 
-    /* The resolved path must start with docroot + '/'. */
     size_t root_len = strlen(docroot);
     if (strncmp(resolved, docroot, root_len) != 0 ||
         (resolved[root_len] != '/' && resolved[root_len] != '\0')) {
         send_error(c->fd, "access denied");
-        printf("[%s:%d] path escape attempt: %s\n", c->ip, c->port, filename);
+        return 0;
+    }
+
+    /* ── Cache lookup (after path validation, before any disk I/O) ── */
+    CacheEntry *ce = cache_lookup(resolved);
+    if (ce) {
+        if (write_all(c->fd, ce->resp, ce->resp_size) < 0) return -1;
+        printf("[%s:%d] served '%s' [cache]\n", c->ip, c->port, filename);
         return 0;
     }
 
@@ -183,23 +268,45 @@ static int serve_file(Client *c, const char *filename) {
         return 0;
     }
 
-    /* ── Open with standard system calls: open() / read() / close() ── */
     int file_fd = open(resolved, O_RDONLY);
     if (file_fd < 0) {
         send_error(c->fd, "open failed");
-        perror("open");
         return 0;
     }
 
-    /* Send the success header: "+OK <size>\n" */
+    /* Build the header once — used for both cache and streaming paths. */
     char header[64];
     int hlen = snprintf(header, sizeof(header), "+OK %lld\n", (long long)st.st_size);
-    if (write_all(c->fd, header, (size_t)hlen) < 0) {
-        close(file_fd);
-        return -1;  /* client went away */
+
+    /* ── Cache-eligible path: read entire file into one buffer ── */
+    if (st.st_size >= 0 && (size_t)st.st_size <= MAX_CACHE_FILE_SIZE) {
+        size_t fsize     = (size_t)st.st_size;
+        size_t resp_size = (size_t)hlen + fsize;
+        char  *resp      = malloc(resp_size + 1); /* +1 to avoid malloc(0) */
+        if (resp) {
+            memcpy(resp, header, (size_t)hlen);
+            ssize_t nr = (fsize > 0) ? pread(file_fd, resp + hlen, fsize, 0) : 0;
+            if (nr == (ssize_t)fsize) {
+                close(file_fd);
+                if (write_all(c->fd, resp, resp_size) < 0) {
+                    free(resp);
+                    return -1;
+                }
+                cache_insert(resolved, resp, resp_size); /* resp ownership transferred */
+                printf("[%s:%d] served '%s' (%lld bytes)\n",
+                       c->ip, c->port, filename, (long long)st.st_size);
+                return 0;
+            }
+            free(resp); /* pread failed; fall through to streaming */
+        }
+        /* malloc failure or pread error: fall through to streaming path. */
     }
 
-    /* Stream the file content in chunks using read() / write(). */
+    /* ── Streaming path: large file or allocation failure ── */
+    if (write_all(c->fd, header, (size_t)hlen) < 0) {
+        close(file_fd);
+        return -1;
+    }
     char fbuf[FILE_BUF_SIZE];
     ssize_t nr;
     while ((nr = read(file_fd, fbuf, sizeof(fbuf))) > 0) {
@@ -208,7 +315,6 @@ static int serve_file(Client *c, const char *filename) {
             return -1;
         }
     }
-
     close(file_fd);
     printf("[%s:%d] served '%s' (%lld bytes)\n",
            c->ip, c->port, filename, (long long)st.st_size);
@@ -251,6 +357,12 @@ static int process_requests(Client *c) {
 
 static void event_loop(int listen_fd) {
     while (running) {
+        /* Process any pending cache-clear signal before blocking in select(). */
+        if (cache_clear_requested) {
+            cache_clear_requested = 0;
+            cache_clear();
+        }
+
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(listen_fd, &read_fds);
@@ -263,8 +375,15 @@ static void event_loop(int listen_fd) {
 
         int ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
         if (ready < 0) {
-            if (errno == EINTR) break;
-            perror("select"); break;
+            /*
+             * EINTR means a signal interrupted select().  Either SIGINT set
+             * running=0 (loop exits via while condition) or SIGUSR1 set
+             * cache_clear_requested=1 (handled at the top of next iteration).
+             * Either way, continue re-evaluates the loop condition and flags.
+             */
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
         }
 
         /* Drain all pending new connections. */
@@ -316,17 +435,20 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    signal(SIGINT, handle_sigint);
+    signal(SIGINT,  handle_sigint);
+    signal(SIGUSR1, handle_sigusr1); /* SIGUSR1 flushes the file cache */
     /* Ignore SIGPIPE so a broken client connection doesn't kill the server. */
     signal(SIGPIPE, SIG_IGN);
 
     int listen_fd = create_listen_socket(port);
-    printf("File server listening on port %d, docroot=%s\n", port, docroot);
+    printf("File server listening on port %d, docroot=%s\n"
+           "(send SIGUSR1 to flush the file cache)\n", port, docroot);
 
     event_loop(listen_fd);
 
     for (int i = 0; i < num_clients; i++) close(clients[i].fd);
     close(listen_fd);
+    cache_clear();
     printf("\nServer shut down.\n");
     return 0;
 }
