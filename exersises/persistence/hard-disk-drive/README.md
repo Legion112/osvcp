@@ -42,6 +42,8 @@ One sector: 30 time unit
 3 * 30 = 90 
 90 + 15 = 105  
 105 + 30 = 135 total
+135 + 30 = 165
 ```txt
 TOTALS      Seek:  0  Rotate:105  Transfer: 30  Total: 135
 ```
+## With seek
