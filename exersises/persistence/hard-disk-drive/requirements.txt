@@ -1,0 +1,4 @@
+# disk.py uses only Python stdlib — no pip packages to install.
+#
+# For graphical mode (-G), install the OS package:
+#   sudo apt install python3-tk
