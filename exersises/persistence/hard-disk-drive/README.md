@@ -30,3 +30,18 @@ python ../../../ostep-hw/file-disks/disk.py -a 10 -G
 ```
 
 Press `s` to start the simulation, `q` to quit.
+
+# Intro
+Start: 6 
+Target: 10
+Speed 1
+Per Track: 12
+One sector: 30 time unit
+105 time total
+10 - 6 = 4 
+3 * 30 = 90 
+90 + 15 = 105  
+105 + 30 = 135 total
+```txt
+TOTALS      Seek:  0  Rotate:105  Transfer: 30  Total: 135
+```
