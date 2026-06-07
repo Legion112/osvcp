@@ -644,5 +644,96 @@ This matches real disks: outer zones are used for faster sequential I/O; inner z
 | Inner bandwidth | **≈0.033 sectors/unit time** (= R/30) |
 | Formula | **`bandwidth = R / zone_angle`** |
 
+---
 
-### 8. A scheduling window determines how many requests the disk can examine at once. Generate random workloads (e.g., -A 1000, -1, 0, with different seeds) and see how long the SATF scheduler takes when the scheduling window is changed from 1 up to the number of requests. How big of a window is needed to maximize performance? Hint: use the -c flag and don’t turn on graphics (-G) to run these quickly. When the scheduling window is set to 1, does it matter which policy you are using?
+### Question 8 — Scheduling window (`-w`) and SATF
+
+#### What is the scheduling window?
+
+The **scheduling window** (`-w`) limits how many **pending requests** the disk scheduler can see when picking the next I/O. With SATF, the drive only runs `DoSATF()` on `requestQueue[0:window]` — it cannot reorder requests outside that window.
+
+- **`-w 1`** — only the next request is visible → **no reordering** (behaves like FIFO)
+- **`-w -1`** — full queue visible → global SATF optimization
+- **Intermediate values** — trade off performance vs fairness / bounded lookahead
+
+Command used:
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a -1 -A 1000,-1,0 -p SATF -w <window> -s <seed> -c
+```
+
+(1000 random requests, blocks 0–35, default `-S 1 -R 1`, no graphics.)
+
+#### SATF total time vs window size (seed 0)
+
+| Window (`-w`) | Total time | vs window=1 | vs optimal |
+|---------------|------------|-------------|------------|
+| 1 | **220,125** | — | +521% |
+| 2 | 149,565 | −32% | +322% |
+| 5 | 86,235 | −61% | +143% |
+| 10 | 64,635 | −71% | +82% |
+| 20 | 48,075 | −78% | +35% |
+| 50 | 38,715 | −82% | +9% |
+| 100 | 37,275 | −83% | +5% |
+| 150 | 36,555 | −83% | +3% |
+| **200** | **35,475** | **−84%** | **optimal** |
+| 500 | 35,475 | −84% | optimal |
+| 1000 | 35,475 | −84% | optimal |
+| **−1 (all)** | **35,475** | **−84%** | **optimal** |
+
+Total time **drops sharply** as the window grows from 1 to ~50, then **levels off**. For seed 0, **window ≥ 200** matches the full-window optimum (`-w -1`).
+
+#### Multiple seeds (window 1 vs 100 vs all)
+
+| Seed | w=1 | w=100 | w=−1 (all) |
+|------|-----|-------|------------|
+| 0 | 220,125 | 37,275 | **35,475** |
+| 1 | 219,195 | 37,245 | **35,835** |
+| 2 | 229,815 | 35,475 | **35,475** |
+| 42 | 227,955 | 37,785 | **37,425** |
+| 99 | 227,085 | 38,535 | **37,455** |
+
+**~100–200 requests** in the window captures most of SATF’s benefit; full window (`-w -1`) is only slightly better (0–5%).
+
+#### How big a window is needed to maximize performance?
+
+**Answer:** For 1000 random requests on this disk, a window of roughly **50–200** gets close to optimal; **`≥ 200` reaches the same total as `-w -1`** (tested with seed 0: all give **35,475**).
+
+| Goal | Suggested window |
+|------|------------------|
+| Near-optimal (~95% of benefit) | **≥ 50** |
+| Match full SATF (seed 0) | **≥ 200** |
+| Full reordering | **`-w -1`** |
+
+Diminishing returns: going from 1→20 saves most time; 50→200 only shaves a few percent.
+
+#### When window = 1, does policy matter?
+
+**No.** With `-w 1`, every policy sees only **one** pending request and must serve it next — no choice, no reordering.
+
+| Policy | seed=0 total | seed=1 | seed=2 | seed=42 |
+|--------|--------------|--------|--------|---------|
+| FIFO | 220,125 | 219,195 | 229,815 | 227,955 |
+| SSTF | 220,125 | 219,195 | 229,815 | 227,955 |
+| SATF | 220,125 | 219,195 | 229,815 | 227,955 |
+| BSATF | 220,125 | 219,195 | 229,815 | 227,955 |
+
+All four policies produce **identical** totals. SATF with window 1 is equivalent to **FIFO**.
+
+#### Why a small window hurts SATF
+
+With 1000 random requests and window 1, the disk must process requests in **arrival order**. It cannot pick a nearer or rotationally aligned request further ahead in the queue — so seek and rotation costs stay high (~220k total vs ~35k with full SATF).
+
+With a large window, SATF can pick the **shortest access time** among many pending requests, similar to NCQ on a real drive (your HDDs have queue depth 32).
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| Effect of increasing window? | Total time **decreases sharply** then **plateaus** |
+| Window to maximize SATF (1000 reqs)? | **≥ ~200** (same as `-w -1` for seed 0); **~50** gets most of the gain |
+| Policy matters at `-w 1`? | **No** — FIFO, SSTF, SATF, BSATF all **identical** |
+| Why? | Window 1 = only one choice → no scheduling freedom |
+
+
+### 9. Create a series of requests to starve a particular request, assuming an SATF policy. Given that sequence, how does it perform if you use a bounded SATF (BSATF) scheduling approach? In this approach, you specify the scheduling window (e.g., -w 4); the scheduler only moves onto the next window of requests when all requests in the current window have been serviced. Does this solve starvation? How does it perform, as compared to SATF? In general, how should a disk make this trade-off between performance and starvation avoidance?
