@@ -505,5 +505,141 @@ For the **inner track** (two tracks from outer), the simulator applies **2× ske
 | Best skew at `-S 2`, `-S 4` | **`-o 1`** → total **255** |
 | Formula | **`skew = ceil(track_width / (S × T_sector))`** where `T_sector = sector_angle / R` |
 
+---
 
-### 7. Specify a disk with different density per zone, e.g., -z 10, 20, 30, which specifies the angular difference between blocks on the outer, middle, and inner tracks. Run some random requests (e.g., -a -1 -A 5, -1, 0, which specifies that random requests should be used via the -a -1 flag and that five requests ranging from 0 to the max be generated), and compute the seek, rotation, and transfer times. Use different random seeds. What is the bandwidth (in sectors per unit time) on the outer, middle, and inner tracks?
+### Question 7 — Zoning (`-z 10,20,30`) and per-track bandwidth
+
+#### What is zoning?
+
+By default (`-z 30,30,30`), every track has the same angular spacing between sectors (30°), so **12 sectors per track**.
+
+**Zoning** models a real disk where **outer tracks hold more sectors** than inner tracks (same linear density, but outer circumference is longer). The `-z` flag sets the **angular width per sector** on each track:
+
+```text
+-z outer,middle,inner   (degrees between sector centers)
+```
+
+With **`-z 10,20,30`**:
+
+| Track | Zone angle | Sectors per track | Block numbers |
+|-------|------------|-------------------|---------------|
+| Outer (0) | 10° | 360/10 = **36** | 0–35 |
+| Middle (1) | 20° | 360/20 = **18** | 36–53 |
+| Inner (2) | 30° | 360/30 = **12** | 54–65 |
+
+Outer sectors are **narrower** (10°) → shorter transfer time per sector. Inner sectors are **wider** (30°) → longer transfer. Total disk capacity: 36 + 18 + 12 = **66 blocks**.
+
+Command:
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -z 10,20,30 -a -1 -A 5,-1,0 -s <seed> -c
+```
+
+#### Random request experiments (different seeds)
+
+Five random requests from 0 to max block (65), FIFO, default `-S 1 -R 1`:
+
+| Seed | Requests | Seek | Rotate | Transfer | **Total** |
+|------|----------|------|--------|----------|-----------|
+| 0 | 45, 40, 22, 13, 27 | 80 | 1025 | 70 | **1175** |
+| 1 | 7, 45, 41, 13, 26 | 80 | 1015 | 70 | **1165** |
+| 2 | 51, 51, 3, 4, 45 | 120 | 530 | 80 | **730** |
+| 3 | 12, 29, 19, 32, 33 | 0 | 825 | 50 | **875** |
+| 7 | 17, 8, 35, 3, 28 | 0 | 1135 | 50 | **1185** |
+| 42 | 34, 1, 14, 12, 39 | 40 | 870 | 60 | **970** |
+
+**Seed 0 detail:**
+
+```
+Block:  45  Seek: 40  Rotate:310  Transfer: 20  Total: 370   (middle track)
+Block:  40  Seek:  0  Rotate:240  Transfer: 20  Total: 260   (middle)
+Block:  22  Seek: 40  Rotate: 85  Transfer: 10  Total: 135   (outer)
+Block:  13  Seek:  0  Rotate:260  Transfer: 10  Total: 270   (outer)
+Block:  27  Seek:  0  Rotate:130  Transfer: 10  Total: 140   (outer)
+TOTALS      Seek: 80  Rotate:1025  Transfer: 70  Total:1175
+```
+
+**Observations from random workloads:**
+
+- **Transfer times vary by zone:** 10 (outer), 20 (middle), 30 (inner) at default `-R 1` — matches the `-z` angles.
+- **Rotation dominates** total time (825–1135 vs seek 0–120) because random requests scatter across tracks.
+- **Same seed can repeat blocks** (seed 2: block 51 twice) — second access may need large rotation.
+- Totals vary widely (730–1185) depending on how often requests cross tracks and how lucky rotational alignment is.
+
+#### Bandwidth per track (sectors per unit time)
+
+**Bandwidth** here means sustained sequential read rate on a **single track** (back-to-back sectors, no seek, no extra rotation):
+
+```text
+bandwidth = R / zone_angle   (sectors per unit time)
+```
+
+At default `-R 1`:
+
+| Track | Zone angle | Transfer per sector | Sequential bandwidth |
+|-------|------------|---------------------|----------------------|
+| **Outer** | 10° | 10 time units | **1/10 = 0.10** sectors/unit time |
+| **Middle** | 20° | 20 time units | **1/20 = 0.05** sectors/unit time |
+| **Inner** | 30° | 30 time units | **1/30 ≈ 0.033** sectors/unit time |
+
+**Outer is 3× faster than inner** for sequential reads (0.10 vs 0.033 sectors/unit time).
+
+General formula:
+
+```text
+bandwidth_track = R / z_track
+```
+
+where `z_track` is the zone angle for that track (10, 20, or 30).
+
+#### Sequential read verification
+
+**Outer track** (`-a 0,1,2,3,4,5`):
+
+```
+Block:   1  Seek:  0  Rotate:  0  Transfer: 10  Total:  10
+Block:   2  Seek:  0  Rotate:  0  Transfer: 10  Total:  10
+...
+```
+
+After the first sector, each outer block costs **10** time units → **0.10 sectors/unit time**.
+
+**Middle track** (`-a 36,37,38,39,40,41`):
+
+```
+Block:  37  Seek:  0  Rotate:  0  Transfer: 20  Total:  20
+...
+```
+
+→ **0.05 sectors/unit time**.
+
+**Inner track** (`-a 54,55,56,57,58,59`):
+
+```
+Block:  55  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+...
+```
+
+→ **≈0.033 sectors/unit time**.
+
+First block on each track still pays seek + rotation to reach the track; bandwidth formula applies to **steady-state sequential** access on that track.
+
+#### Why outer tracks have higher bandwidth
+
+Outer tracks pack **more sectors** into the same 360° (36 vs 12 on inner). Each sector spans fewer degrees, so:
+
+- **Shorter transfer time** per sector (10 vs 30)
+- **Higher sequential throughput** (0.10 vs 0.033 sectors/unit time)
+
+This matches real disks: outer zones are used for faster sequential I/O; inner zones have lower linear density and slower per-sector transfer.
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| `-z 10,20,30` layout | Outer 36 sectors (0–35), middle 18 (36–53), inner 12 (54–65) |
+| Random requests | Transfer = zone angle at `-R 1`; rotation usually dominates; totals vary by seed |
+| Outer bandwidth | **0.10 sectors/unit time** (= R/10) |
+| Middle bandwidth | **0.05 sectors/unit time** (= R/20) |
+| Inner bandwidth | **≈0.033 sectors/unit time** (= R/30) |
+| Formula | **`bandwidth = R / zone_angle`** |
