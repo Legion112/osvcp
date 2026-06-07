@@ -643,3 +643,6 @@ This matches real disks: outer zones are used for faster sequential I/O; inner z
 | Middle bandwidth | **0.05 sectors/unit time** (= R/20) |
 | Inner bandwidth | **≈0.033 sectors/unit time** (= R/30) |
 | Formula | **`bandwidth = R / zone_angle`** |
+
+
+### 8. A scheduling window determines how many requests the disk can examine at once. Generate random workloads (e.g., -A 1000, -1, 0, with different seeds) and see how long the SATF scheduler takes when the scheduling window is changed from 1 up to the number of requests. How big of a window is needed to maximize performance? Hint: use the -c flag and don’t turn on graphics (-G) to run these quickly. When the scheduling window is set to 1, does it matter which policy you are using?
