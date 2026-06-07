@@ -79,5 +79,13 @@ Compute the seek, rotation, and transfer times for the following sets of request
     - total: 330 + 45 = 330 
   - `8`
     - seek: 80
-    - 
-- `-a 10, 11, 12, 13`
+    - Rotate:310
+    - Transfer: 30
+    - Total: 420
+  - Result: Seek:160  Rotate:545  Transfer: 90  Total: 795
+- `-a 10,11,12,13`
+  - Block:  10  Seek:  0  Rotate:105  Transfer: 30  Total: 135
+    Block:  11  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+    Block:  12  Seek: 40  Rotate:320  Transfer: 30  Total: 390
+    Block:  13  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+    TOTALS      Seek: 40  Rotate:425  Transfer:120  Total: 585
