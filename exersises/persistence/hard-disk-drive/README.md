@@ -197,3 +197,6 @@ TOTALS      Seek:160  Rotate:3289  Transfer:900  Total:4349
 |---|-----------|----------|----------|----------------------|
 | **Higher `-S` (faster seek)** | Decreases | Often increases | Unchanged | Often unchanged; can improve multi-track alignment |
 | **Lower `-R` (slower spin)** | Unchanged | Increases | Increases | Always increases (~1/R for rotate+transfer) |
+
+
+### 4 FIFO is not always best, e.g., with the request stream -a 7, 30, 8, what order should the requests be processed in? Run the shortest seek time first (SSTF) scheduler (-p SSTF) on this workload; how long should it take (seek, rotation, transfer) for each request to be served?
