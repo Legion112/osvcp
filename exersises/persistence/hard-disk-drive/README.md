@@ -371,5 +371,136 @@ SSTF keeps 10 → 20 (same middle track after first read), avoiding the expensiv
 
 **Rule of thumb:** SSTF optimizes **distance**; SATF optimizes **time**. They differ when seek distance and rotational position disagree.
 
+---
 
-### 6. Here is a request stream to try: -a 10, 11, 12, 13. What goes poorly when it runs? Try adding track skew to address this problem (-o skew). Given the default seek rate, what should the skew be to maximize performance? What about for different seek rates (e.g., -S 2, -S 4)? In general, could you write a formula to figure out the skew?
+### Question 6 — Track skew for `-a 10,11,12,13`
+
+#### What is track skew?
+
+Real disks store more sectors on outer tracks than inner tracks. When the OS reads sequential blocks (10, 11, 12, 13), block 12 is often on the **next inward track**. While the head **seeks** inward, the platter keeps spinning.
+
+Without skew, sector 12 on the middle track sits at the **same angular position** as sector 0 on the outer track. After reading sector 11, the head seeks one track inward — but sector 12 has already spun past. The drive waits almost a **full revolution** (~320 time units) before it can read block 12.
+
+**Track skew** offsets sectors on inner tracks forward (in the direction of rotation) so that, after a one-track seek, the next sequential sector is **under the head**. In this simulator, `-o N` shifts the middle track by **N blocks** and the inner track by **2N blocks**:
+
+```text
+middle track angle += N × 30°
+inner track angle  += 2N × 30°
+```
+
+(30° = one sector at default zoning.)
+
+#### What goes poorly without skew (`-o 0`)?
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 10,11,12,13 -c
+```
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 10 | 0 | 105 | 30 | 135 |
+| 11 | 0 | 0 | 30 | **30** |
+| 12 | 40 | **320** | 30 | **390** |
+| 13 | 0 | 0 | 30 | **30** |
+| **TOTALS** | **40** | **425** | **120** | **585** |
+
+- **Blocks 10 → 11:** same outer track, sequential — rotate **0**. Good.
+- **Block 12:** one-track seek inward — seek is only 40, but rotation is **320** (nearly a full spin). This is the bottleneck.
+- **Block 13:** same middle track as 12, adjacent — rotate **0**. Good.
+
+**Problem:** the outer → middle transition (11 → 12) pays a huge rotational penalty because sector 12 is not skewed to account for seek time.
+
+#### Skew experiments (default `-S 1`, `-R 1`)
+
+| Skew (`-o`) | Block 12 rotate | Block 12 total | **Overall total** |
+|-------------|-----------------|----------------|-------------------|
+| 0 | 320 | 390 | 585 |
+| 1 | 350 | 420 | 615 |
+| **2** | **20** | **90** | **285** ← best |
+| 3 | 50 | 120 | 315 |
+| 12 | 320 | 390 | 585 |
+
+**Optimal skew at default seek rate: `-o 2`**
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 10,11,12,13 -o 2 -c
+```
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 10 | 0 | 105 | 30 | 135 |
+| 11 | 0 | 0 | 30 | 30 |
+| 12 | 40 | **20** | 30 | **90** |
+| 13 | 0 | 0 | 30 | 30 |
+| **TOTALS** | **40** | **125** | **120** | **285** |
+
+Block 12 rotation drops from **320 → 20**. Total time **585 → 285** (saved 300 time units).
+
+#### Skew at different seek rates
+
+Seek and rotation trade off during a track change — faster seek means less platter rotation during the seek, so **less skew** is needed.
+
+| Seek rate (`-S`) | One-track seek time | Optimal skew | Total time |
+|------------------|---------------------|--------------|------------|
+| 1 (default) | 40 / 1 = **40** | **2** | **285** |
+| 2 | 40 / 2 = **20** | **1** | **255** |
+| 4 | 40 / 4 = **10** | **1** | **255** |
+
+**`-S 2 -o 1`:**
+
+```
+Block:  12  Seek: 20  Rotate: 10  Transfer: 30  Total:  60
+TOTALS      Seek: 20  Rotate:115  Transfer:120  Total: 255
+```
+
+**`-S 4 -o 1`:**
+
+```
+Block:  12  Seek: 10  Rotate: 20  Transfer: 30  Total:  60
+TOTALS      Seek: 10  Rotate:125  Transfer:120  Total: 255
+```
+
+At S=2 and S=4, skew=1 minimizes total time. Seek time shrinks but block 12 still needs a small rotation (10–20) because one block of skew is slightly more than strictly needed — still far better than skew=0.
+
+#### General skew formula
+
+For a **one-track inward** step in this simulator:
+
+```text
+T_seek     = track_width / S          (track_width = 40 by default)
+T_sector   = sector_angle / R         (sector_angle = 30° by default, R = rotate speed)
+
+skew_blocks = ceil(T_seek / T_sector)
+            = ceil(track_width / (S × T_sector))
+            = ceil(40 / (30 × S))     at default R=1
+```
+
+With rotation rate `-R`:
+
+```text
+skew_blocks = ceil(track_width × R / (sector_angle × S))
+            = ceil(40 × R / (30 × S))
+```
+
+**Examples (R=1):**
+
+| S | T_seek | skew = ceil(40/(30×S)) |
+|---|--------|-------------------------|
+| 1 | 40 | ceil(1.33) = **2** |
+| 2 | 20 | ceil(0.67) = **1** |
+| 4 | 10 | ceil(0.33) = **1** |
+| 8 | 5 | ceil(0.17) = **1** |
+
+**Intuition:** during a one-track seek, the disk rotates through `T_seek / T_sector` sector widths. Skew the next track forward by that many sectors (rounded up) so the next sequential block arrives at the head right when the seek completes.
+
+For the **inner track** (two tracks from outer), the simulator applies **2× skew** automatically (`-o N` → middle gets N blocks, inner gets 2N).
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| What goes poorly? | Block **12** after cross-track seek — **320** rotation (almost full revolution) while blocks 11 and 13 need none |
+| Fix | Track skew (`-o`) offsets inner-track sectors forward |
+| Best skew at `-S 1` | **`-o 2`** → total **285** |
+| Best skew at `-S 2`, `-S 4` | **`-o 1`** → total **255** |
+| Formula | **`skew = ceil(track_width / (S × T_sector))`** where `T_sector = sector_angle / R` |
