@@ -47,3 +47,23 @@ One sector: 30 time unit
 TOTALS      Seek:  0  Rotate:105  Transfer: 30  Total: 135
 ```
 ## With seek
+
+Notes:
+Full rotation: 360 
+
+
+## Questions
+### 1.
+Compute the seek, rotation, and transfer times for the following sets of requests: 
+- `-a 0`
+  - `360/2-15=165 Rotatin till start of sector 0
+  - 30 reading sector 165 + 30 = 195
+- `-a 6`
+  - 360-15=345 rotation till start of sector 6
+  - 30 reading sector 345 + 30 = 375 Total time
+- `-a 30`
+  - seek: 80
+  - 360 - 80 = 280 - 15 = 265 till get to start of sector 30
+  - 30 reading sector 265 + 30 = 295
+- `-a 7,30,8` 
+- `-a 10, 11, 12, 13`
