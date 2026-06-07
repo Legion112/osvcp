@@ -271,4 +271,102 @@ Block:   8  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
 Block:  30  Seek: 80  Rotate:190  Transfer: 30  Total: 300
 TOTALS      Seek: 80  Rotate:205  Transfer: 90  Total: 375
 ```
-### 5 Now use the shortest access-time first (SATF) scheduler (-p SATF). Does it make any difference for -a 7, 30, 8 workload? Find a set of requests where SATF outperforms SSTF; more generally, when is SATF better than SSTF?
+
+---
+
+### Question 5 — SATF vs SSTF (`-p SATF`)
+
+**SATF** (Shortest Access Time First) picks the request with the smallest estimated **seek + rotation + transfer**. **SSTF** (Shortest Seek Time First) only minimizes seek distance; when several blocks share the nearest track, SSTF then uses SATF among them.
+
+Commands:
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 7,30,8 -p SATF -c
+python ../../../ostep-hw/file-disks/disk.py -a 6,20 -p SATF -c
+python ../../../ostep-hw/file-disks/disk.py -a 6,20,8 -p SSTF -c
+python ../../../ostep-hw/file-disks/disk.py -a 6,20,8 -p SATF -c
+```
+
+#### Does SATF differ for `-a 7,30,8`?
+
+**No.** SATF and SSTF produce identical results:
+
+| Policy | Order | Seek | Rotate | Transfer | **Total** |
+|--------|-------|------|--------|----------|-----------|
+| SSTF | 7 → 8 → 30 | 80 | 205 | 90 | **375** |
+| SATF | 7 → 8 → 30 | 80 | 205 | 90 | **375** |
+
+After serving sector 7, sector 8 wins on **both** metrics:
+
+- **Shortest seek:** 8 is on the same track (0) vs 30 (80)
+- **Shortest access time:** 8 needs 0 rotation; 30 needs 80 seek + 190 rotation
+
+There is no conflict between seek and rotation here, so SATF adds nothing beyond SSTF.
+
+#### Example where SATF outperforms SSTF: `-a 6,20`
+
+| Policy | Order | Seek | Rotate | Transfer | **Total** |
+|--------|-------|------|--------|----------|-----------|
+| FIFO | 6 → 20 | 40 | 695 | 60 | **795** |
+| SSTF | 6 → 20 | 40 | 695 | 60 | **795** |
+| **SATF** | **20 → 6** | 80 | 235 | 60 | **375** |
+
+**SSTF** serves sector 6 first (same track, seek 0) — but that requires **345** rotation from the default start position. **SATF** notices sector 20 on the middle track is rotationally aligned: one 40-unit seek plus only **5** rotation → total **75** for block 20, then seek back for block 6.
+
+SATF per-request breakdown:
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 20 | 40 | 5 | 30 | **75** |
+| 6 | 40 | 230 | 30 | **300** |
+| **TOTALS** | **80** | **235** | **60** | **375** |
+
+#### Stronger 3-request example: `-a 6,20,8`
+
+| Policy | Order | **Total** |
+|--------|-------|-----------|
+| FIFO | 6 → 20 → 8 | 1155 |
+| SSTF | 8 → 6 → 20 | 795 |
+| **SATF** | **20 → 6 → 8** | **435** |
+
+SATF beats SSTF by **360** time units (795 → 435).
+
+SATF per-request breakdown:
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 20 | 40 | 5 | 30 | **75** |
+| 6 | 40 | 230 | 30 | **300** |
+| 8 | 0 | 30 | 30 | **60** |
+| **TOTALS** | **80** | **265** | **90** | **435** |
+
+SSTF serves outer-track requests first (8 → 6 → 20) because they have shorter seeks, but still pays **350** rotation for block 20. SATF serves the rotationally favorable middle-track block 20 first, then recovers outer-track requests cheaply.
+
+#### When is SATF better than SSTF?
+
+| Situation | Why SATF wins |
+|-----------|---------------|
+| A farther track is **rotationally close** (sector about to pass the head after a short seek) | SATF picks it; SSTF waits for a nearer track that requires nearly a full revolution |
+| **Seek vs rotation trade-off** — same-track request needs long rotation, cross-track request needs short seek + little rotation | SATF minimizes total access time; SSTF blindly prefers zero seek |
+| Initial head position favors a non-nearest track | Example: `-a 6,20` from default start (halfway through sector 6) |
+
+#### When is SSTF better than SATF?
+
+SATF can be **greedy** and hurt overall performance:
+
+| Example | SSTF total | SATF total | What goes wrong |
+|---------|------------|------------|-----------------|
+| `-a 10,20` | **435** | 495 | SATF serves 20 first (75), then 10 costs 420 — nearly a full rotation back |
+
+SSTF keeps 10 → 20 (same middle track after first read), avoiding the expensive return seek + rotation.
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| SATF vs SSTF for `-a 7,30,8`? | **No difference** — both yield 375 (order 7 → 8 → 30) |
+| Request set where SATF beats SSTF? | **`-a 6,20`** (795 → 375) or **`-a 6,20,8`** (795 → 435) |
+| When is SATF better? | When a request on a **farther track** has **lower total access time** because it is rotationally aligned, and SSTF's seek-only view would pick a nearer track that requires waiting almost a full spin |
+| When is SSTF better? | When serving a rotationally favorable far request first **breaks sequential locality** on the nearer track, making later requests much more expensive |
+
+**Rule of thumb:** SSTF optimizes **distance**; SATF optimizes **time**. They differ when seek distance and rotational position disagree.
