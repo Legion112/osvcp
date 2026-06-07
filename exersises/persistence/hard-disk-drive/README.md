@@ -75,7 +75,8 @@ Compute the seek, rotation, and transfer times for the following sets of request
     - 10 * 30 = 300 rotation from starting poit
     - 300 - 80 = 220 time spend for rotation 
     - 30 reading sector 220 + 30 = 250
-    - total: 250 + 45 = 295
+    - sector total 80 + 250 = 330
+    - total: 330 + 45 = 330 
   - `8`
     - seek: 80
     - 
