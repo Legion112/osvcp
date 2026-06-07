@@ -84,8 +84,23 @@ Compute the seek, rotation, and transfer times for the following sets of request
     - Total: 420
   - Result: Seek:160  Rotate:545  Transfer: 90  Total: 795
 - `-a 10,11,12,13`
-  - Block:  10  Seek:  0  Rotate:105  Transfer: 30  Total: 135
-    Block:  11  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
-    Block:  12  Seek: 40  Rotate:320  Transfer: 30  Total: 390
-    Block:  13  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
-    TOTALS      Seek: 40  Rotate:425  Transfer:120  Total: 585
+- Block:  10  Seek:  0  Rotate:105  Transfer: 30  Total: 135
+  Block:  11  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+  Block:  12  Seek: 40  Rotate:320  Transfer: 30  Total: 390
+  Block:  13  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+  TOTALS      Seek: 40  Rotate:425  Transfer:120  Total: 585
+### 2 Do the same requests above, but change the seek rate to different values: -S 2, -S 4, -S 8, -S 10, -S 40, -S 0.1. How do the times change?
+How do the times change when varying -S?
+
+No seek → no effect. -a 0 and -a 6 are unchanged for all -S.
+
+Seek and rotation trade off. For requests that need a seek, faster -S lowers seek time but the platter keeps spinning, so rotation often increases by the same amount. Total often stays the same (e.g. -a 30: 375 for S=1…40; -a 10,11,12,13: 585 for S=1…40).
+
+Transfer time is unchanged (30 per sector).
+
+Multi-track sequences can improve with faster seek. For -a 7,30,8, at S≥4 the return seek to sector 8 aligns much better → block 8 total drops from 420 to 60 and overall total from 795 to 435.
+
+Very slow seek (S=0.1) hurts badly. Seek time dominates; totals jump (e.g. -a 30: 1095, -a 7,30,8: 2235, -a 10,11,12,13: 945).
+
+Rule: seek speed affects how seek and rotation split the wait, not always the sum — except when slow seek changes rotational alignment or when faster seek lands the head near the next sector.
+### 3 Do the same requests above, but change the rotation rate: -R 0.1, -R 0.5, -R 0.01. How do the times change?
