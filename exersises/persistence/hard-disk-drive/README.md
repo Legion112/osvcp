@@ -504,3 +504,6 @@ For the **inner track** (two tracks from outer), the simulator applies **2× ske
 | Best skew at `-S 1` | **`-o 2`** → total **285** |
 | Best skew at `-S 2`, `-S 4` | **`-o 1`** → total **255** |
 | Formula | **`skew = ceil(track_width / (S × T_sector))`** where `T_sector = sector_angle / R` |
+
+
+### 7. Specify a disk with different density per zone, e.g., -z 10, 20, 30, which specifies the angular difference between blocks on the outer, middle, and inner tracks. Run some random requests (e.g., -a -1 -A 5, -1, 0, which specifies that random requests should be used via the -a -1 flag and that five requests ranging from 0 to the max be generated), and compute the seek, rotation, and transfer times. Use different random seeds. What is the bandwidth (in sectors per unit time) on the outer, middle, and inner tracks?
