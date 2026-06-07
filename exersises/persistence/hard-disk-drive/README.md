@@ -65,5 +65,18 @@ Compute the seek, rotation, and transfer times for the following sets of request
   - seek: 80
   - 360 - 80 = 280 - 15 = 265 till get to start of sector 30
   - 30 reading sector 265 + 30 = 295
-- `-a 7,30,8` 
+- `-a 7,30,8`
+  - `7`
+    - 15 till start of sector 7
+    - 30 read sector 7 = 15 + 30 = 45
+  - `30`
+    - seek: 80 
+    - 10 sector till start of sector 30
+    - 10 * 30 = 300 rotation from starting poit
+    - 300 - 80 = 220 time spend for rotation 
+    - 30 reading sector 220 + 30 = 250
+    - total: 250 + 45 = 295
+  - `8`
+    - seek: 80
+    - 
 - `-a 10, 11, 12, 13`
