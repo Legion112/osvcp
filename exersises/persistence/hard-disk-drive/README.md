@@ -874,3 +874,6 @@ For our primary sequence, BSATF `-w 4` **effectively fixes** starvation of block
 | Does BSATF solve starvation? | **Mostly** — bounds delay within window batches; not strict FIFO |
 | vs SATF performance? | Often **slightly worse** total time, but **much better** for deferred requests; can be **much slower** if victim is forced first (525 vs 885 example) |
 | Trade-off? | **Bigger window → faster, less fair**; **BSATF → middle ground** between SATF and FIFO |
+
+
+### 10. All the scheduling policies we have looked at thus far are greedy; they pick the next best option instead of looking for an optimal schedule. Can you find a set of requests in which greedy is not optimal?
