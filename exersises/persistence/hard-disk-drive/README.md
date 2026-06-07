@@ -370,3 +370,6 @@ SSTF keeps 10 → 20 (same middle track after first read), avoiding the expensiv
 | When is SSTF better? | When serving a rotationally favorable far request first **breaks sequential locality** on the nearer track, making later requests much more expensive |
 
 **Rule of thumb:** SSTF optimizes **distance**; SATF optimizes **time**. They differ when seek distance and rotational position disagree.
+
+
+### 6. Here is a request stream to try: -a 10, 11, 12, 13. What goes poorly when it runs? Try adding track skew to address this problem (-o skew). Given the default seek rate, what should the skew be to maximize performance? What about for different seek rates (e.g., -S 2, -S 4)? In general, could you write a formula to figure out the skew?
