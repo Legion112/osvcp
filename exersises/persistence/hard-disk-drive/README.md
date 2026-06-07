@@ -875,5 +875,81 @@ For our primary sequence, BSATF `-w 4` **effectively fixes** starvation of block
 | vs SATF performance? | Often **slightly worse** total time, but **much better** for deferred requests; can be **much slower** if victim is forced first (525 vs 885 example) |
 | Trade-off? | **Bigger window → faster, less fair**; **BSATF → middle ground** between SATF and FIFO |
 
+---
 
-### 10. All the scheduling policies we have looked at thus far are greedy; they pick the next best option instead of looking for an optimal schedule. Can you find a set of requests in which greedy is not optimal?
+### Question 10 — When greedy scheduling is not optimal
+
+All policies in this simulator (FIFO, SSTF, SATF, BSATF) make **local** decisions — they never search for a globally optimal order. **SATF** is the most aggressive greedy policy: at each step it picks the request with the **shortest estimated access time right now**, without considering how that choice affects later requests.
+
+#### Example 1: `-a 10,20` (SATF greedy loses)
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 10,20 -p SATF -w -1 -c
+python ../../../ostep-hw/file-disks/disk.py -a 10,20 -p SSTF -w -1 -c
+```
+
+| Policy | Order | Seek | Rotate | Transfer | **Total** |
+|--------|-------|------|--------|----------|-----------|
+| **SSTF / FIFO (optimal here)** | **10 → 20** | 40 | 335 | 60 | **435** |
+| **SATF (greedy)** | **20 → 10** | 80 | 355 | 60 | **495** |
+
+**Greedy SATF** picks block **20** first (seek 40, rotate 5, total 75 — looks best from the default start position). But then block **10** costs **420** (seek back to outer track + nearly full rotation) → **495** total.
+
+**Better schedule 10 → 20:** serve block 10 first (135), then seek one track to block 20 on the same middle track area (300) → **435** total — **60 time units faster**.
+
+```
+SATF (greedy):     20 (75)  →  10 (420)  = 495
+Optimal:           10 (135) →  20 (300)  = 435
+```
+
+**Why greedy fails:** SATF only minimizes **next-step** cost. Serving 20 first saves rotation now but creates an expensive return trip to 10.
+
+#### Example 2: `-a 10,20,11` (greedy SATF vs better schedule)
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 10,20,11 -p SATF -w -1 -c
+python ../../../ostep-hw/file-disks/disk.py -a 10,20,11 -p SSTF -w -1 -c
+```
+
+| Policy | Order | **Total** |
+|--------|-------|-----------|
+| **SSTF (better)** | **10 → 11 → 20** | **435** |
+| **SATF (greedy)** | 20 → 11 → 10 | **495** |
+| FIFO | 10 → 20 → 11 | 525 |
+
+SATF greedily serves **20, 11** first (cheap from start), then pays **330** for block 10. Order **10 → 11 → 20** keeps blocks 10 and 11 on the outer track together before one seek to 20 — **60 units** less than SATF.
+
+#### Example 3: `-a 12,10` (greedy SSTF/SATF lose)
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 12,10 -p FIFO -c
+python ../../../ostep-hw/file-disks/disk.py -a 12,10 -p SSTF -w -1 -c
+```
+
+| Policy | Order | **Total** |
+|--------|-------|-----------|
+| **FIFO (optimal here)** | **12 → 10** | **495** |
+| SSTF / SATF (greedy) | 10 → 12 | **555** |
+
+Greedy policies pick outer-track block **10** first (zero seek). Optimal order serves middle-track **12** first, then **10** — **60 units** faster overall.
+
+#### Summary comparison
+
+| Request set | Greedy policy | Greedy total | Better order | Optimal total | Penalty |
+|-------------|---------------|--------------|--------------|---------------|---------|
+| **10,20** | SATF | 495 | 10 → 20 | **435** | +60 (+14%) |
+| **10,20,11** | SATF | 495 | 10 → 11 → 20 | **435** | +60 (+14%) |
+| **12,10** | SSTF / SATF | 555 | 12 → 10 | **495** | +60 (+12%) |
+
+#### Why no greedy policy is globally optimal
+
+Computing the true optimal schedule is like solving a **Traveling Salesman Problem** over disk locations — expensive and rarely done in real disks. Greedy policies trade optimality for speed:
+
+| Policy | Greedy rule | Can miss global optimum when… |
+|--------|-------------|-------------------------------|
+| FIFO | serve oldest | never reorders (may be slow, but not "short-sighted" in same way) |
+| SSTF | shortest seek | ignores rotation; e.g. `-a 12,10` |
+| SATF | shortest access time now | defers requests that become expensive later; e.g. `-a 10,20` |
+| BSATF | SATF within batches | bounded but still local |
+
+**Answer:** Yes — **`-a 10,20`** is a minimal counterexample: greedy **SATF totals 495**, but order **10 → 20** achieves **435**. Greedy picks the locally best request (20) and pays heavily on the next one (10). Real disks accept this trade-off and use fast heuristics (SATF/SSTF-like) rather than optimal scheduling.
