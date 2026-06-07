@@ -735,5 +735,142 @@ With a large window, SATF can pick the **shortest access time** among many pendi
 | Policy matters at `-w 1`? | **No** — FIFO, SSTF, SATF, BSATF all **identical** |
 | Why? | Window 1 = only one choice → no scheduling freedom |
 
+---
 
-### 9. Create a series of requests to starve a particular request, assuming an SATF policy. Given that sequence, how does it perform if you use a bounded SATF (BSATF) scheduling approach? In this approach, you specify the scheduling window (e.g., -w 4); the scheduler only moves onto the next window of requests when all requests in the current window have been serviced. Does this solve starvation? How does it perform, as compared to SATF? In general, how should a disk make this trade-off between performance and starvation avoidance?
+### Question 9 — Starvation, SATF vs BSATF
+
+#### Background
+
+**SATF** with a large window (`-w -1`) always picks the globally shortest access time. A request on a **far track** (expensive seek) can wait indefinitely if the queue keeps filling with **nearby outer-track** requests that always look cheaper.
+
+**BSATF** (Bounded SATF) uses `-w N` as a **fairness window**:
+
+- Starts by only seeing the first **N** requests in the queue
+- After every **N** completed I/Os, the window **advances by N** (next batch becomes visible)
+- Within each window, scheduling is still SATF
+
+This limits how long early requests can be skipped once their batch is active.
+
+#### Starvation sequence
+
+Place the **victim** on the inner track first, then flood with cheap outer-track requests:
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 30,0,1,2,3,0,1,2,3,0,1,2,3 -p SATF -w -1 -c
+python ../../../ostep-hw/file-disks/disk.py -a 30,0,1,2,3,0,1,2,3,0,1,2,3 -p BSATF -w 4 -c
+```
+
+**Block 30** (inner track) is the victim — it arrives **first** but SATF keeps preferring blocks 0–3 on the outer track.
+
+#### SATF — victim starved
+
+**`-p SATF -w -1`** (full reordering):
+
+| Service order | Block | Seek | Rotate | Transfer | Total |
+|---------------|-------|------|--------|----------|-------|
+| 1st | 0 | 0 | 165 | 30 | 195 |
+| 2nd–4th | 1, 2, 3 | … | 0 | 30 | 30 each |
+| 5th–12th | 0,1,2,3 × 2 more rounds | … | … | 30 | … |
+| **13th (last)** | **30** | 80 | 340 | 30 | **450** |
+
+```
+TOTALS      Seek: 80  Rotate:985  Transfer:390  Total:1455
+```
+
+Block **30 is served last** despite being first in the queue. SATF defers the expensive inner-track seek while twelve cheap outer-track requests run first.
+
+**`-p SATF -w 4`** gives the **same order and total (1455)** — a fixed SATF window without fairness batching does not help here.
+
+#### FIFO / BSATF — victim served early
+
+**`-p FIFO`** (baseline — no starvation):
+
+| Service order | Block | Total |
+|---------------|-------|-------|
+| **1st** | **30** | **375** |
+| 2nd–13th | 0,1,2,3, … | … |
+
+```
+TOTALS      Seek:160  Rotate:815  Transfer:390  Total:1365
+```
+
+**`-p BSATF -w 4`**:
+
+| Service order | Block | Total |
+|---------------|-------|-------|
+| 1st–3rd | 0, 1, 2 | 195, 30, 30 |
+| **4th** | **30** | **120** |
+| 5th–13th | remaining outer blocks | … |
+
+```
+Block:  30  Seek: 80  Rotate: 10  Transfer: 30  Total: 120   ← 4th, not 13th
+TOTALS      Seek:160  Rotate:815  Transfer:390  Total:1365
+```
+
+Within the first window `{30, 0, 1, 2}`, SATF serves 0, 1, 2 first — but **30 must run before the window advances**. Block 30 is served **4th** instead of **13th**, with much less rotation (10 vs 340).
+
+#### Comparison (starvation sequence)
+
+| Policy | Block 30 service order | Block 30 rotate | **Total time** |
+|--------|------------------------|-------------------|----------------|
+| FIFO | **1st** | 265 | **1365** |
+| **BSATF -w 4** | **4th** | **10** | **1365** |
+| SATF -w -1 | 13th (last) | 340 | 1455 |
+| SATF -w 4 | 13th (last) | 340 | 1455 |
+
+**BSATF matches FIFO total time** on this workload while still using SATF **within** each batch. **SATF costs 90 extra time units** (+7%) due to deferring block 30.
+
+#### Second example — performance vs fairness trade-off
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 35,0,1,2,3,4,5,6,7,8,9,10,11 -p SATF -w -1 -c
+python ../../../ostep-hw/file-disks/disk.py -a 35,0,1,2,3,4,5,6,7,8,9,10,11 -p BSATF -w 4 -c
+```
+
+Victim **block 35** (inner track) first, then outer blocks 0–11:
+
+| Policy | Block 35 order | **Total time** |
+|--------|----------------|----------------|
+| **SATF -w -1** | **13th (last)** | **525** ← faster overall |
+| **BSATF -w 4** | **1st** | **885** ← victim first, +69% slower |
+
+Here SATF achieves lower total time by deferring the costly inner-track request until the head is already on the outer track. BSATF **prevents starvation** (35 runs first) but **hurts performance** significantly.
+
+#### Does BSATF solve starvation?
+
+**Partially — for requests inside the current window batch.**
+
+| | SATF | BSATF |
+|---|------|-------|
+| Can a request wait forever? | **Yes** — if cheaper requests keep arriving | **No within a batch** — once in the active window, request will be picked after at most (window−1) cheaper neighbors |
+| Guarantees FIFO order? | No | No — still SATF within window |
+| Window advances | SATF: fixed or grows to full queue | BSATF: +N after every N completions |
+
+BSATF **does not fully solve starvation globally** (a request in batch 5 could still wait while batches 1–4 run), but it **bounds delay** compared to unbounded SATF: a request is at worst delayed until its batch becomes active, then at most **N−1** other requests in that batch ahead of it.
+
+For our primary sequence, BSATF `-w 4` **effectively fixes** starvation of block 30 (4th vs 13th).
+
+#### Performance vs starvation — how should a disk trade off?
+
+| Approach | Throughput | Fairness / latency for unlucky requests |
+|----------|------------|-------------------------------------------|
+| **SATF (-w -1)** | **Best** — always picks shortest access time | **Worst** — distant requests can starve |
+| **BSATF (-w N)** | **Middle** — SATF within batches only | **Better** — bounded wait per batch |
+| **FIFO / window=1** | **Worst** for random I/O | **Best** — strict arrival order |
+
+**Practical guidance:**
+
+1. **Large window / full SATF** — maximize throughput on mixed workloads (batch jobs, random reads).
+2. **BSATF with moderate N** (e.g. 4–32, similar to real NCQ depth) — balance: most SATF benefit, bounded starvation.
+3. **Small window or FIFO** — when **fairness** or **latency SLAs** matter (interactive + background I/O).
+4. Real disks use **NCQ (depth ~32)** plus firmware heuristics — analogous to BSATF with a bounded reorder window, not unbounded global SATF.
+
+#### Summary
+
+| Question | Answer |
+|----------|--------|
+| Starvation example? | **`-a 30,0,1,2,3,0,1,2,3,0,1,2,3`** — block 30 last under SATF |
+| BSATF `-w 4` on that sequence? | Block 30 served **4th**; total **1365** (same as FIFO, better than SATF **1455**) |
+| Does BSATF solve starvation? | **Mostly** — bounds delay within window batches; not strict FIFO |
+| vs SATF performance? | Often **slightly worse** total time, but **much better** for deferred requests; can be **much slower** if victim is forced first (525 vs 885 example) |
+| Trade-off? | **Bigger window → faster, less fair**; **BSATF → middle ground** between SATF and FIFO |
