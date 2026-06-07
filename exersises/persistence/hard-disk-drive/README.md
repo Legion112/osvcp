@@ -198,5 +198,76 @@ TOTALS      Seek:160  Rotate:3289  Transfer:900  Total:4349
 | **Higher `-S` (faster seek)** | Decreases | Often increases | Unchanged | Often unchanged; can improve multi-track alignment |
 | **Lower `-R` (slower spin)** | Unchanged | Increases | Increases | Always increases (~1/R for rotate+transfer) |
 
+---
 
-### 4 FIFO is not always best, e.g., with the request stream -a 7, 30, 8, what order should the requests be processed in? Run the shortest seek time first (SSTF) scheduler (-p SSTF) on this workload; how long should it take (seek, rotation, transfer) for each request to be served?
+### Question 4 — FIFO vs SSTF for `-a 7,30,8`
+
+FIFO is not always best. For this workload, SSTF should service **7 → 8 → 30** instead of FIFO's **7 → 30 → 8**.
+
+**Why:** After reading sector 7, the head is on the outer track near sector 8. SSTF picks the request with the shortest seek distance next:
+
+- Sector **8** — same track, seek **0**
+- Sector **30** — inner track, seek **80**
+
+So SSTF serves 8 before making the long seek to 30.
+
+Commands:
+
+```bash
+python ../../../ostep-hw/file-disks/disk.py -a 7,30,8 -c          # FIFO (default)
+python ../../../ostep-hw/file-disks/disk.py -a 7,30,8 -p SSTF -c  # SSTF
+```
+
+#### FIFO (default policy)
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 7 | 0 | 15 | 30 | **45** |
+| 30 | 80 | 220 | 30 | **330** |
+| 8 | 80 | 310 | 30 | **420** |
+| **TOTALS** | **160** | **545** | **90** | **795** |
+
+Order: **7 → 30 → 8**. After sector 7, FIFO seeks all the way to the inner track for 30, then seeks back to outer for 8 — two expensive 80-unit seeks.
+
+#### SSTF (`-p SSTF`)
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 7 | 0 | 15 | 30 | **45** |
+| 8 | 0 | 0 | 30 | **30** |
+| 30 | 80 | 190 | 30 | **300** |
+| **TOTALS** | **80** | **205** | **90** | **375** |
+
+Order: **7 → 8 → 30**.
+
+**Block 7:** Same as FIFO — 15° rotation, 30 transfer.
+
+**Block 8:** No seek (adjacent sector on same track after reading 7). No rotation wait — read point already under head. Transfer only → **30**.
+
+**Block 30:** One seek inward (**80**). From end-of-read on outer track (between 7 and 8), CCW to sector 30 start = 270° zero-cost rotation; minus 80° during seek → **190** rotation. Transfer **30**. Per-block total **300**.
+
+#### Comparison
+
+| Policy | Order | Total seek | Total rotate | Total transfer | **Total time** |
+|--------|-------|------------|--------------|----------------|----------------|
+| FIFO | 7 → 30 → 8 | 160 | 545 | 90 | **795** |
+| SSTF | 7 → 8 → 30 | 80 | 205 | 90 | **375** |
+
+SSTF cuts total time roughly in half (**795 → 375**) by eliminating one 80-unit seek and reading sector 8 while the head is already on the outer track.
+
+**Answer:** Process requests in order **7, 8, 30**. With `-p SSTF`, each request takes:
+
+| Block | Seek | Rotate | Transfer | Total |
+|-------|------|--------|----------|-------|
+| 7 | 0 | 15 | 30 | 45 |
+| 8 | 0 | 0 | 30 | 30 |
+| 30 | 80 | 190 | 30 | 300 |
+
+Simulator output:
+
+```
+Block:   7  Seek:  0  Rotate: 15  Transfer: 30  Total:  45
+Block:   8  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
+Block:  30  Seek: 80  Rotate:190  Transfer: 30  Total: 300
+TOTALS      Seek: 80  Rotate:205  Transfer: 90  Total: 375
+```
