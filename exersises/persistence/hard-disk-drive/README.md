@@ -271,3 +271,4 @@ Block:   8  Seek:  0  Rotate:  0  Transfer: 30  Total:  30
 Block:  30  Seek: 80  Rotate:190  Transfer: 30  Total: 300
 TOTALS      Seek: 80  Rotate:205  Transfer: 90  Total: 375
 ```
+### 5 Now use the shortest access-time first (SATF) scheduler (-p SATF). Does it make any difference for -a 7, 30, 8 workload? Find a set of requests where SATF outperforms SSTF; more generally, when is SATF better than SSTF?
